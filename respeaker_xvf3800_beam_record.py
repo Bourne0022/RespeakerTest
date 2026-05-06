@@ -236,10 +236,10 @@ class SpatialMonitor:
     angle_tolerance_deg : float
         Allowed deviation from *target_angle_deg*.
     ref_energy : float or None
-        Reference speech energy from calibration.  ``None`` disables the
-        energy gate.
+        Reference speech energy from calibration at the target distance.
+        ``None`` disables the energy gate.
     energy_tolerance : float
-        Allowed fractional deviation from *ref_energy* (0.0 – 1.0).
+        Allowed fractional drop below *ref_energy* (0.0 – 1.0).
     """
 
     def __init__(
@@ -328,8 +328,11 @@ class SpatialMonitor:
             and self.ref_energy is not None
             and self.ref_energy > 0.0
         ):
-            deviation = abs(energy - self.ref_energy) / self.ref_energy
-            energy_ok = deviation <= self.energy_tolerance
+            # Distance filtering is implemented as a lower-bound energy gate:
+            # calibrate at 0.5 m, then accept the calibrated energy or louder.
+            # This accepts closer talkers and rejects quieter/farther talkers.
+            min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
+            energy_ok = energy >= min_energy
 
         return doa_ok, energy_ok, doa_deg, energy
 
@@ -843,6 +846,7 @@ def record(
     energy_tolerance: float = 0.5,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
+    trigger_on_voice: bool = False,
 ) -> RecordStats:
     """Run the recording session.
 
@@ -868,11 +872,15 @@ def record(
         Reference speech energy from calibration.  ``None`` disables the
         energy/distance gate.
     energy_tolerance : float
-        Allowed fractional deviation from *ref_energy* (0.0 – 1.0).
+        Allowed fractional drop below *ref_energy* (0.0 – 1.0).
     enable_spatial : bool
         When False the spatial monitor is not started (plain RMS-only gate).
     stop_event : threading.Event or None
         Optional external stop signal, used by GUI frontends.
+    trigger_on_voice : bool
+        When True, the WAV file is opened only after the first chunk that
+        passes the RMS/DOA/energy checks.  If no qualifying speech is seen,
+        no WAV file is created.
 
     Returns
     -------
@@ -891,6 +899,8 @@ def record(
         )
 
     ctrl = ReSpeakerControl(dev)
+    spatial: Optional[SpatialMonitor] = None
+    wf: Optional[wave.Wave_write] = None
     try:
         # ---- 2. configure beam & routing ----------------------------------
         configure_device(ctrl, beam_deg)
@@ -927,7 +937,6 @@ def record(
         )
 
         # ---- 4b. initialise spatial monitor (DOA + energy) ---------------
-        spatial: Optional[SpatialMonitor] = None
         if enable_spatial:
             spatial = SpatialMonitor(
                 ctrl=ctrl,
@@ -939,7 +948,8 @@ def record(
             spatial.start(interval=0.25)
             if ref_energy is not None:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"energy ±{energy_tolerance * 100:.0f}% (ref={ref_energy:.6f})")
+                      f"energy >= {(1.0 - energy_tolerance) * 100:.0f}% of ref "
+                      f"(ref={ref_energy:.6f})")
             else:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
                       f"energy gate DISABLED (no calibration)")
@@ -979,85 +989,96 @@ def record(
         else:
             print("Use the GUI stop button or an external stop signal to stop early.\n")
 
-        with wave.open(output_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(SAMPLE_WIDTH_BYTES)
-            wf.setframerate(SAMPLE_RATE)
+        def _ensure_wave_open() -> wave.Wave_write:
+            nonlocal wf
+            if wf is None:
+                wf = wave.open(output_path, "wb")
+                wf.setnchannels(1)
+                wf.setsampwidth(SAMPLE_WIDTH_BYTES)
+                wf.setframerate(SAMPLE_RATE)
+            return wf
 
-            with sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=BLOCKSIZE,
-                device=input_index,
-                callback=callback,
-            ):
-                while True:
-                    # -- stop conditions --
-                    if stop_event.is_set():
-                        print("\nStopped by user request.")
-                        break
+        if not trigger_on_voice:
+            _ensure_wave_open()
 
-                    elapsed = time.monotonic() - t_start
-                    if elapsed >= duration_sec:
-                        print(f"\nReached max duration ({duration_sec:.1f} s).")
-                        break
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=BLOCKSIZE,
+            device=input_index,
+            callback=callback,
+        ):
+            while True:
+                # -- stop conditions --
+                if stop_event.is_set():
+                    print("\nStopped by user request.")
+                    break
 
-                    # -- fetch next audio block --
-                    try:
-                        chunk = q.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
+                elapsed = time.monotonic() - t_start
+                if elapsed >= duration_sec:
+                    print(f"\nReached max duration ({duration_sec:.1f} s).")
+                    break
 
-                    stats.received_chunks += 1
-                    stats.received_frames += len(chunk) // (SAMPLE_WIDTH_BYTES * CHANNELS)
+                # -- fetch next audio block --
+                try:
+                    chunk = q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-                    # -- RMS gate decision --
-                    level = rms_int16_mono(chunk, channels=CHANNELS)
-                    if level > stats.peak_rms:
-                        stats.peak_rms = level
+                stats.received_chunks += 1
+                stats.received_frames += len(chunk) // (SAMPLE_WIDTH_BYTES * CHANNELS)
 
-                    if gate.update(level):
-                        # -- spatial filter (DOA + energy) --
-                        write_chunk = True
-                        if spatial is not None:
-                            doa_ok, energy_ok, doa_deg, energy = spatial.check()
-                            if doa_deg is not None:
-                                stats.doa_samples.append(doa_deg)
-                            if not doa_ok:
-                                stats.doa_rejects += 1
-                                write_chunk = False
-                            if not energy_ok:
-                                stats.energy_rejects += 1
-                                write_chunk = False
+                # -- RMS gate decision --
+                level = rms_int16_mono(chunk, channels=CHANNELS)
+                if level > stats.peak_rms:
+                    stats.peak_rms = level
 
-                        if write_chunk:
-                            mono = extract_mono_bytes(chunk, channels=CHANNELS)
+                if gate.update(level):
+                    # -- spatial filter (DOA + energy) --
+                    write_chunk = True
+                    if spatial is not None:
+                        doa_ok, energy_ok, doa_deg, energy = spatial.check()
+                        if doa_deg is not None:
+                            stats.doa_samples.append(doa_deg)
+                        if not doa_ok:
+                            stats.doa_rejects += 1
+                            write_chunk = False
+                        if not energy_ok:
+                            stats.energy_rejects += 1
+                            write_chunk = False
+
+                    if write_chunk:
+                        if trigger_on_voice and wf is None:
+                            _ensure_wave_open()
+                            print("Qualifying speech detected; recording started.")
+                        mono = extract_mono_bytes(chunk, channels=CHANNELS)
+                        if wf is not None:
                             wf.writeframesraw(mono)
                             stats.saved_chunks += 1
                             stats.saved_frames += len(mono) // SAMPLE_WIDTH_BYTES
 
-                    # -- periodic status (every ~2 s) --
-                    now = time.monotonic()
-                    if now - last_status_time >= 2.0:
-                        state = "OPEN" if gate.open else "CLOSED"
-                        parts = [
-                            f"  [{elapsed:5.1f}s]  ",
-                            f"RMS={level:.4f} (smoothed={gate.smoothed_rms:.4f})  ",
-                            f"gate={state}",
-                        ]
-                        if spatial is not None:
-                            doa_ok, energy_ok, doa_deg, _ = spatial.check()
-                            if doa_deg is not None:
-                                tag = "OK" if doa_ok else "OFF-AXIS"
-                                parts.append(f"  DOA={doa_deg:.1f}° {tag}")
-                            else:
-                                parts.append("  DOA=--")
-                            parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
+                # -- periodic status (every ~2 s) --
+                now = time.monotonic()
+                if now - last_status_time >= 2.0:
+                    state = "OPEN" if gate.open else "CLOSED"
+                    parts = [
+                        f"  [{elapsed:5.1f}s]  ",
+                        f"RMS={level:.4f} (smoothed={gate.smoothed_rms:.4f})  ",
+                        f"gate={state}",
+                    ]
+                    if spatial is not None:
+                        doa_ok, energy_ok, doa_deg, _ = spatial.check()
+                        if doa_deg is not None:
+                            tag = "OK" if doa_ok else "OFF-AXIS"
+                            parts.append(f"  DOA={doa_deg:.1f}° {tag}")
                         else:
-                            parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
-                        print("".join(parts))
-                        last_status_time = now
+                            parts.append("  DOA=--")
+                        parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
+                    else:
+                        parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
+                    print("".join(parts))
+                    last_status_time = now
 
     except KeyboardInterrupt:
         print("\nRecording interrupted by Ctrl+C.", file=sys.stderr)
@@ -1070,7 +1091,12 @@ def record(
     finally:
         if spatial is not None:
             spatial.stop()
+        if wf is not None:
+            wf.close()
         ctrl.close()
+
+    if trigger_on_voice and stats.saved_frames == 0:
+        print("No qualifying speech detected; WAV file was not created.", file=sys.stderr)
 
     return stats
 
@@ -1139,7 +1165,11 @@ def parse_args():
     )
     p.add_argument(
         "--energy-tolerance", type=float, default=0.5,
-        help="Allowed energy deviation as fraction 0–1 (default: 0.5 = ±50%%)",
+        help="Allowed energy drop below reference as fraction 0–1 (default: 0.5)",
+    )
+    p.add_argument(
+        "--trigger-on-voice", action="store_true",
+        help="Create the WAV only after the first RMS/DOA/energy-approved voice chunk",
     )
     p.add_argument(
         "--target-distance", type=float, default=0.5,
@@ -1230,6 +1260,7 @@ def main() -> int:
             ref_energy=ref_energy,
             energy_tolerance=args.energy_tolerance,
             enable_spatial=not args.no_spatial,
+            trigger_on_voice=args.trigger_on_voice,
         )
     except RuntimeError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
@@ -1258,7 +1289,10 @@ def main() -> int:
         doa_arr = stats.doa_samples
         print(f"  DOA mean  : {statistics.mean(doa_arr):.1f}°  "
               f"(min={min(doa_arr):.1f}°, max={max(doa_arr):.1f}°)")
-    print(f"  Output    : {args.output}")
+    if args.trigger_on_voice and not pathlib.Path(args.output).exists():
+        print("  Output    : not created (no qualifying voice detected)")
+    else:
+        print(f"  Output    : {args.output}")
     print(f"{'─' * 40}")
 
     if saved_sec == 0.0:

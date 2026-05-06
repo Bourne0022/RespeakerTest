@@ -54,7 +54,8 @@ class RecorderApp(tk.Tk):
         self.attack_var = tk.StringVar(value="40")
         self.hold_var = tk.StringVar(value="400")
         self.device_var = tk.StringVar(value="XVF3800")
-        self.spatial_var = tk.BooleanVar(value=False)
+        self.spatial_var = tk.BooleanVar(value=True)
+        self.trigger_var = tk.BooleanVar(value=True)
         self.calibration_var = tk.StringVar(value=str(pathlib.Path.cwd() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="就绪")
@@ -98,6 +99,7 @@ class RecorderApp(tk.Tk):
         options = ttk.Frame(settings)
         options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(options, text="启用空间过滤（需要 calibration.json）", variable=self.spatial_var).pack(side="left")
+        ttk.Checkbutton(options, text="检测到有效人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="录完后播放", variable=self.playback_var).pack(side="left", padx=(18, 0))
 
         ttk.Label(settings, text="标定文件").grid(row=5, column=0, sticky="w", pady=(8, 0))
@@ -114,7 +116,7 @@ class RecorderApp(tk.Tk):
 
         hint = ttk.Label(
             root,
-            text="提示：固定波束负责 30°；0.5 米以内需要靠 RMS 门限或标定后的空间过滤近似判断。",
+            text="提示：默认等待 30°、0.5 米标定范围内的人声。未检测到有效人声时不会生成 WAV。",
             foreground="#444",
         )
         hint.pack(fill="x", pady=(0, 8))
@@ -177,6 +179,12 @@ class RecorderApp(tk.Tk):
             rms = self._validate_float(self.rms_var.get(), "RMS 门限", 0.0)
             attack = self._validate_float(self.attack_var.get(), "Attack 时间", 0.0)
             hold = self._validate_float(self.hold_var.get(), "Hold 时间", 0.0)
+            if self.trigger_var.get() and not self.spatial_var.get():
+                raise ValueError("检测到有效人声后才生成文件时，必须启用空间过滤")
+            if self.spatial_var.get():
+                cal_path = pathlib.Path(self.calibration_var.get()).expanduser().resolve()
+                if not cal_path.exists():
+                    raise ValueError("启用空间过滤需要先生成并选择 calibration.json")
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
@@ -218,9 +226,12 @@ class RecorderApp(tk.Tk):
                 if cal_path.exists():
                     cal = recorder._load_calibration(str(cal_path))
                     ref_energy = cal.get("ref_energy")
+                    if ref_energy is None or float(ref_energy) <= 0:
+                        raise RuntimeError("calibration.json 中缺少有效的 ref_energy")
+                    ref_energy = float(ref_energy)
                     self.log_queue.put(f"已加载标定文件：{cal_path}\n")
                 else:
-                    self.log_queue.put("未找到标定文件，空间能量过滤将不可用。\n")
+                    raise RuntimeError("未找到标定文件，无法进行 0.5 米空间过滤")
 
             writer = TextQueueWriter(self.log_queue)
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
@@ -232,15 +243,21 @@ class RecorderApp(tk.Tk):
                     beam_deg=beam,
                     attack_ms=attack,
                     hold_ms=hold,
+                    angle_tolerance_deg=20.0,
                     ref_energy=ref_energy,
+                    energy_tolerance=0.30,
                     enable_spatial=enable_spatial,
                     stop_event=self.stop_event,
+                    trigger_on_voice=self.trigger_var.get(),
                 )
 
             captured_sec = stats.received_frames / recorder.SAMPLE_RATE
             saved_sec = stats.saved_frames / recorder.SAMPLE_RATE
             self.log_queue.put("\n--- 录音完成 ---\n")
-            self.log_queue.put(f"输出文件：{output_path}\n")
+            if output_path.exists():
+                self.log_queue.put(f"输出文件：{output_path}\n")
+            else:
+                self.log_queue.put("未检测到符合 30° / 0.5 米条件的人声，未生成 WAV 文件。\n")
             self.log_queue.put(f"采集时长：{captured_sec:.2f} 秒\n")
             self.log_queue.put(f"保存时长：{saved_sec:.2f} 秒\n")
             self.log_queue.put(f"Peak RMS：{stats.peak_rms:.4f}\n")
@@ -248,7 +265,7 @@ class RecorderApp(tk.Tk):
                 self.log_queue.put(f"DOA 拒绝块数：{stats.doa_rejects}\n")
                 self.log_queue.put(f"能量拒绝块数：{stats.energy_rejects}\n")
 
-            if self.playback_var.get():
+            if self.playback_var.get() and output_path.exists():
                 status = self._playback(output_path)
                 self.log_queue.put(f"播放状态：{status}\n")
 
