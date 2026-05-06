@@ -1051,7 +1051,7 @@ def record(
                     if write_chunk:
                         if trigger_on_voice and wf is None:
                             _ensure_wave_open()
-                            print("Qualifying speech detected; recording started.")
+                            print("检测到符合条件的人声，开始写入 WAV。")
                         mono = extract_mono_bytes(chunk, channels=CHANNELS)
                         if wf is not None:
                             wf.writeframesraw(mono)
@@ -1096,7 +1096,7 @@ def record(
         ctrl.close()
 
     if trigger_on_voice and stats.saved_frames == 0:
-        print("No qualifying speech detected; WAV file was not created.", file=sys.stderr)
+        print("未检测到符合条件的人声，未生成 WAV 文件。", file=sys.stderr)
 
     return stats
 
