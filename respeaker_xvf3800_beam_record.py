@@ -842,6 +842,7 @@ def record(
     ref_energy: Optional[float] = None,
     energy_tolerance: float = 0.5,
     enable_spatial: bool = True,
+    stop_event: Optional[threading.Event] = None,
 ) -> RecordStats:
     """Run the recording session.
 
@@ -870,6 +871,8 @@ def record(
         Allowed fractional deviation from *ref_energy* (0.0 – 1.0).
     enable_spatial : bool
         When False the spatial monitor is not started (plain RMS-only gate).
+    stop_event : threading.Event or None
+        Optional external stop signal, used by GUI frontends.
 
     Returns
     -------
@@ -942,11 +945,14 @@ def record(
                       f"energy gate DISABLED (no calibration)")
 
         # ---- 5. keyboard listener (daemon thread) -------------------------
-        stop_event = threading.Event()
-        kb_thread = threading.Thread(
-            target=_any_key_stop, args=(stop_event,), daemon=True
-        )
-        kb_thread.start()
+        if stop_event is None:
+            stop_event = threading.Event()
+        keyboard_stop_enabled = sys.stdin is not None and sys.stdin.isatty()
+        if keyboard_stop_enabled:
+            kb_thread = threading.Thread(
+                target=_any_key_stop, args=(stop_event,), daemon=True
+            )
+            kb_thread.start()
 
         # ---- 6. audio queue & callback ------------------------------------
         q: queue.Queue[bytes] = queue.Queue(maxsize=64)
@@ -968,7 +974,10 @@ def record(
         print(f"RMS threshold : {rms_threshold:.4f}  "
               f"(attack={attack_ms:.0f} ms, hold={hold_ms:.0f} ms)")
         print(f"Max duration  : {duration_sec:.1f} s")
-        print("Press any key to stop early.\n")
+        if keyboard_stop_enabled:
+            print("Press any key to stop early.\n")
+        else:
+            print("Use the GUI stop button or an external stop signal to stop early.\n")
 
         with wave.open(output_path, "wb") as wf:
             wf.setnchannels(1)
@@ -986,7 +995,7 @@ def record(
                 while True:
                     # -- stop conditions --
                     if stop_event.is_set():
-                        print("\nStopped by user keypress.")
+                        print("\nStopped by user request.")
                         break
 
                     elapsed = time.monotonic() - t_start

@@ -44,12 +44,11 @@ class RecorderApp(tk.Tk):
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.stop_event: threading.Event | None = None
+        self.auto_output_path = True
 
-        now = time.strftime("%Y%m%d_%H%M%S")
-        default_output = pathlib.Path.cwd() / f"xvf3800_record_{now}.wav"
-
-        self.output_var = tk.StringVar(value=str(default_output))
-        self.duration_var = tk.StringVar(value="5")
+        self.output_var = tk.StringVar(value=str(self._default_output_path()))
+        self.duration_var = tk.StringVar(value="30")
         self.beam_var = tk.StringVar(value="30")
         self.rms_var = tk.StringVar(value="0.03")
         self.attack_var = tk.StringVar(value="40")
@@ -62,6 +61,10 @@ class RecorderApp(tk.Tk):
 
         self._build_ui()
         self.after(100, self._drain_log_queue)
+
+    def _default_output_path(self) -> pathlib.Path:
+        now = time.strftime("%Y%m%d_%H%M%S")
+        return pathlib.Path.cwd() / f"xvf3800_record_{now}.wav"
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=14)
@@ -105,11 +108,13 @@ class RecorderApp(tk.Tk):
         controls.pack(fill="x", pady=(12, 8))
         self.start_button = ttk.Button(controls, text="开始录音", command=self._start_recording)
         self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(controls, text="停止录音", command=self._stop_recording, state="disabled")
+        self.stop_button.pack(side="left", padx=(10, 0))
         ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=(16, 0))
 
         hint = ttk.Label(
             root,
-            text="提示：默认关闭空间过滤，只按固定波束和 RMS 门限录音。需要角度/距离过滤时，先完成标定再勾选空间过滤。",
+            text="提示：固定波束负责 30°；0.5 米以内需要靠 RMS 门限或标定后的空间过滤近似判断。",
             foreground="#444",
         )
         hint.pack(fill="x", pady=(0, 8))
@@ -132,6 +137,7 @@ class RecorderApp(tk.Tk):
             initialfile=pathlib.Path(self.output_var.get()).name,
         )
         if path:
+            self.auto_output_path = False
             self.output_var.set(path)
 
     def _browse_calibration(self) -> None:
@@ -157,6 +163,8 @@ class RecorderApp(tk.Tk):
             return
 
         try:
+            if self.auto_output_path:
+                self.output_var.set(str(self._default_output_path()))
             output_path = pathlib.Path(self.output_var.get()).expanduser().resolve()
             if output_path.exists() and output_path.is_dir():
                 output_path = output_path / f"xvf3800_record_{time.strftime('%Y%m%d_%H%M%S')}.wav"
@@ -174,7 +182,9 @@ class RecorderApp(tk.Tk):
             return
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.stop_event = threading.Event()
         self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
         self.status_var.set("录音中...")
         self._log("\n--- 开始录音 ---\n")
 
@@ -184,6 +194,11 @@ class RecorderApp(tk.Tk):
             daemon=True,
         )
         self.worker.start()
+
+    def _stop_recording(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+            self.status_var.set("正在停止...")
 
     def _record_worker(
         self,
@@ -219,6 +234,7 @@ class RecorderApp(tk.Tk):
                     hold_ms=hold,
                     ref_energy=ref_energy,
                     enable_spatial=enable_spatial,
+                    stop_event=self.stop_event,
                 )
 
             captured_sec = stats.received_frames / recorder.SAMPLE_RATE
@@ -257,9 +273,13 @@ class RecorderApp(tk.Tk):
                 if item == "__STATUS__DONE":
                     self.status_var.set("完成")
                     self.start_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                    self.stop_event = None
                 elif item == "__STATUS__ERROR":
                     self.status_var.set("出错")
                     self.start_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                    self.stop_event = None
                 else:
                     self._log(item)
         except queue.Empty:
