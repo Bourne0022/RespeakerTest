@@ -20,7 +20,7 @@ import sys
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    """Run calibration to measure reference RMS at the target position."""
+    """Run calibration to measure reference speech energy at the target position."""
     import respeaker_xvf3800_beam_record as r
 
     print("=" * 58)
@@ -35,18 +35,31 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         rms_threshold=0.005,
         device_hint=args.device_hint,
         beam_deg=args.angle,
-        enable_spatial=False,
+        angle_tolerance_deg=180.0,     # disable DOA gate
+        ref_energy=None,                # disable energy gate
+        enable_spatial=True,            # collect speech energy samples
     )
 
-    ref_energy = stats.peak_rms
+    import statistics
+    if stats.energy_samples:
+        ref_energy = statistics.mean(stats.energy_samples)
+        print(f"\nEnergy samples: {len(stats.energy_samples)}")
+        print(f"Energy mean: {ref_energy:.1f}")
+    else:
+        print("\nWARNING: No speech energy samples collected. Is the sound source active?")
+        ref_energy = 0.0
+
+    if stats.doa_samples:
+        print(f"DOA mean: {statistics.mean(stats.doa_samples):.1f}°")
+
     r._save_calibration(
         args.cal_json,
         target_angle_deg=args.angle,
         target_distance_m=args.distance,
         ref_energy=ref_energy,
-        ref_rms=ref_energy,
+        ref_rms=stats.peak_rms,
     )
-    print(f"\nReference energy: {ref_energy:.6f}")
+    print(f"\nReference energy: {ref_energy:.1f}  (peak RMS: {stats.peak_rms:.6f})")
     print("Calibration complete. Run 'python test.py record' to use it.")
 
     # Clean up temp file
@@ -58,16 +71,16 @@ def cmd_record(args: argparse.Namespace) -> int:
     """Record with spatial filtering enabled."""
     import respeaker_xvf3800_beam_record as r
 
-    # Load calibration if available
     ref_energy = args.ref_energy
-    if ref_energy is None and not args.no_spatial:
+    if ref_energy is None and args.distance_gate and not args.no_spatial:
         try:
             cal = r._load_calibration(args.cal_json)
             ref_energy = cal.get("ref_energy")
             print(f"Calibration loaded: ref_energy={ref_energy:.6f}")
         except (FileNotFoundError, KeyError):
-            print("No calibration file found – energy gate disabled.")
-            print("Run 'python test.py calibrate' first.")
+            print("No calibration file found – distance gate disabled.")
+    elif not args.distance_gate:
+        print("Distance gate disabled; using angle gate only.")
 
     stats = r.record(
         output_path=args.output,
@@ -80,7 +93,9 @@ def cmd_record(args: argparse.Namespace) -> int:
         angle_tolerance_deg=args.angle_tolerance,
         ref_energy=ref_energy,
         energy_tolerance=args.energy_tolerance,
+        ratio_threshold=args.ratio_threshold,
         enable_spatial=not args.no_spatial,
+        trigger_on_voice=args.trigger_on_voice,
     )
 
     recv_sec = stats.received_frames / 16000
@@ -90,9 +105,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     print(f"\n{'─' * 40}")
     print(f"  Captured : {recv_sec:.2f}s  Saved: {saved_sec:.2f}s ({ratio:.1f}%)")
     print(f"  Peak RMS : {stats.peak_rms:.4f}")
-    if stats.doa_rejects or stats.energy_rejects:
+    if stats.speech_rejects or stats.doa_rejects or stats.energy_rejects or stats.ratio_rejects:
+        print(f"  Speech rejects: {stats.speech_rejects}")
         print(f"  DOA rejects   : {stats.doa_rejects}")
         print(f"  Energy rejects: {stats.energy_rejects}")
+        print(f"  Ratio rejects : {stats.ratio_rejects}")
+    print(f"  Speech samples: {stats.speech_samples}")
     if stats.doa_samples:
         import statistics
         print(f"  DOA mean  : {statistics.mean(stats.doa_samples):.1f}°")
@@ -160,6 +178,12 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--cal-json", default="calibration.json")
     rec.add_argument("--no-spatial", action="store_true",
                      help="Disable spatial filter")
+    rec.add_argument("--distance-gate", action="store_true",
+                     help="Enable distance gate by loading calibration.json")
+    rec.add_argument("--trigger-on-voice", action="store_true", default=True,
+                     help="Only create WAV after voice is detected")
+    rec.add_argument("--ratio-threshold", type=float, default=0.0,
+                     help="Optional front/back focus ratio E0/(E0+E1); 0 disables it (default: 0)")
 
     # -- analyze ------------------------------------------------------------
     ana = sub.add_parser("analyze", help="Analyze WAV file RMS blocks")

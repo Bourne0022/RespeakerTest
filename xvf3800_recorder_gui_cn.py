@@ -6,6 +6,7 @@ import contextlib
 import io
 import pathlib
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -20,6 +21,7 @@ except ImportError:  # pragma: no cover
 
 
 APP_TITLE = "XVF3800 波束录音工具"
+DEFAULT_REF_ENERGY = 0.086293
 
 
 class TextQueueWriter(io.TextIOBase):
@@ -48,16 +50,19 @@ class RecorderApp(tk.Tk):
         self.auto_output_path = True
 
         self.output_var = tk.StringVar(value=str(self._default_output_path()))
-        self.duration_var = tk.StringVar(value="30")
+        self.duration_var = tk.StringVar(value="0")
         self.beam_var = tk.StringVar(value="30")
         self.rms_var = tk.StringVar(value="0.03")
         self.attack_var = tk.StringVar(value="40")
         self.hold_var = tk.StringVar(value="400")
         self.device_var = tk.StringVar(value="XVF3800")
         self.spatial_var = tk.BooleanVar(value=True)
+        self.distance_gate_var = tk.BooleanVar(value=True)
         self.trigger_var = tk.BooleanVar(value=True)
-        self.calibration_var = tk.StringVar(value=str(pathlib.Path.cwd() / "calibration.json"))
+        self.calibration_var = tk.StringVar(value=str(self._app_dir() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
+        self.angle_tolerance_var = tk.StringVar(value="25")
+        self.ratio_threshold_var = tk.StringVar(value="0.0")
         self.status_var = tk.StringVar(value="就绪")
 
         self._build_ui()
@@ -65,7 +70,12 @@ class RecorderApp(tk.Tk):
 
     def _default_output_path(self) -> pathlib.Path:
         now = time.strftime("%Y%m%d_%H%M%S")
-        return pathlib.Path.cwd() / f"xvf3800_record_{now}.wav"
+        return self._app_dir() / f"xvf3800_record_{now}.wav"
+
+    def _app_dir(self) -> pathlib.Path:
+        if getattr(sys, "frozen", False):
+            return pathlib.Path(sys.executable).resolve().parent
+        return pathlib.Path.cwd()
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=14)
@@ -98,13 +108,19 @@ class RecorderApp(tk.Tk):
 
         options = ttk.Frame(settings)
         options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        ttk.Checkbutton(options, text="启用空间过滤（需要 calibration.json）", variable=self.spatial_var).pack(side="left")
-        ttk.Checkbutton(options, text="检测到有效人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(options, text="启用角度门控（无需定标）", variable=self.spatial_var).pack(side="left")
+        ttk.Checkbutton(options, text="启用距离门控（需要标定）", variable=self.distance_gate_var).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(options, text="检测到人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="录完后播放", variable=self.playback_var).pack(side="left", padx=(18, 0))
 
-        ttk.Label(settings, text="标定文件").grid(row=5, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(settings, textvariable=self.calibration_var).grid(row=5, column=1, columnspan=2, sticky="ew", padx=(8, 8), pady=(8, 0))
-        ttk.Button(settings, text="浏览", command=self._browse_calibration).grid(row=5, column=3, sticky="ew", pady=(8, 0))
+        ttk.Label(settings, text="角度容差（度）").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(settings, textvariable=self.angle_tolerance_var, width=10).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(settings, text="波束比阈值").grid(row=5, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(settings, textvariable=self.ratio_threshold_var, width=10).grid(row=5, column=3, sticky="w", pady=(8, 0))
+
+        ttk.Label(settings, text="标定文件（仅距离门控使用）").grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(settings, textvariable=self.calibration_var).grid(row=6, column=1, columnspan=2, sticky="ew", padx=(8, 8), pady=(8, 0))
+        ttk.Button(settings, text="浏览", command=self._browse_calibration).grid(row=6, column=3, sticky="ew", pady=(8, 0))
 
         controls = ttk.Frame(root)
         controls.pack(fill="x", pady=(12, 8))
@@ -116,7 +132,7 @@ class RecorderApp(tk.Tk):
 
         hint = ttk.Label(
             root,
-            text="提示：默认等待 30°、0.5 米标定范围内的人声。未检测到有效人声时不会生成 WAV。",
+            text="提示：当前默认按设备语音检测 + 30° 方向门控录音；标定文件仅用于以后启用距离门控。",
             foreground="#444",
         )
         hint.pack(fill="x", pady=(0, 8))
@@ -129,7 +145,7 @@ class RecorderApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self._log("就绪。默认模式会录制固定波束音频，不启用空间过滤。\n")
+        self._log("就绪。当前默认是无定标模式，只做 30° 方向门控和人声触发。\n")
 
     def _browse_output(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -174,17 +190,15 @@ class RecorderApp(tk.Tk):
             elif output_path.suffix.lower() != ".wav":
                 output_path = output_path.with_suffix(".wav")
                 self.output_var.set(str(output_path))
-            duration = self._validate_float(self.duration_var.get(), "录音时长", 0.1)
+            duration = self._validate_float(self.duration_var.get(), "录音时长", 0.0)
             beam = self._validate_float(self.beam_var.get(), "波束角度")
             rms = self._validate_float(self.rms_var.get(), "RMS 门限", 0.0)
             attack = self._validate_float(self.attack_var.get(), "Attack 时间", 0.0)
             hold = self._validate_float(self.hold_var.get(), "Hold 时间", 0.0)
-            if self.trigger_var.get() and not self.spatial_var.get():
-                raise ValueError("检测到有效人声后才生成文件时，必须启用空间过滤")
-            if self.spatial_var.get():
-                cal_path = pathlib.Path(self.calibration_var.get()).expanduser().resolve()
-                if not cal_path.exists():
-                    raise ValueError("启用空间过滤需要先生成并选择 calibration.json")
+            angle_tolerance = self._validate_float(self.angle_tolerance_var.get(), "角度容差", 0.0)
+            ratio_threshold = self._validate_float(self.ratio_threshold_var.get(), "波束比阈值", 0.0)
+            if ratio_threshold > 1.0:
+                raise ValueError("波束比阈值必须小于等于 1.0")
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, str(exc))
             return
@@ -198,7 +212,7 @@ class RecorderApp(tk.Tk):
 
         self.worker = threading.Thread(
             target=self._record_worker,
-            args=(output_path, duration, beam, rms, attack, hold),
+            args=(output_path, duration, beam, rms, attack, hold, angle_tolerance, ratio_threshold),
             daemon=True,
         )
         self.worker.start()
@@ -216,22 +230,34 @@ class RecorderApp(tk.Tk):
         rms: float,
         attack: float,
         hold: float,
+        angle_tolerance: float,
+        ratio_threshold: float,
     ) -> None:
         ref_energy = None
         enable_spatial = self.spatial_var.get()
+        enable_distance = self.distance_gate_var.get()
 
         try:
-            if enable_spatial:
+            if enable_spatial and enable_distance:
                 cal_path = pathlib.Path(self.calibration_var.get()).expanduser().resolve()
                 if cal_path.exists():
                     cal = recorder._load_calibration(str(cal_path))
                     ref_energy = cal.get("ref_energy")
                     if ref_energy is None or float(ref_energy) <= 0:
-                        raise RuntimeError("calibration.json 中缺少有效的 ref_energy")
-                    ref_energy = float(ref_energy)
-                    self.log_queue.put(f"已加载标定文件：{cal_path}\n")
+                        ref_energy = DEFAULT_REF_ENERGY
+                        self.log_queue.put(
+                            f"标定文件无有效 ref_energy，改用默认参考值 {DEFAULT_REF_ENERGY:.6f}\n"
+                        )
+                    else:
+                        ref_energy = float(ref_energy)
+                        self.log_queue.put(f"已加载标定文件：{cal_path}\n")
                 else:
-                    raise RuntimeError("未找到标定文件，无法进行 0.5 米空间过滤")
+                    ref_energy = DEFAULT_REF_ENERGY
+                    self.log_queue.put(
+                        f"未找到标定文件：使用默认参考值 {DEFAULT_REF_ENERGY:.6f}。\n"
+                    )
+            elif enable_spatial and not enable_distance:
+                self.log_queue.put("未启用距离门控：仅使用 30° 角度门控 + 人声触发。\n")
 
             writer = TextQueueWriter(self.log_queue)
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
@@ -243,9 +269,10 @@ class RecorderApp(tk.Tk):
                     beam_deg=beam,
                     attack_ms=attack,
                     hold_ms=hold,
-                    angle_tolerance_deg=20.0,
+                    angle_tolerance_deg=angle_tolerance,
                     ref_energy=ref_energy,
                     energy_tolerance=0.30,
+                    ratio_threshold=ratio_threshold,
                     enable_spatial=enable_spatial,
                     stop_event=self.stop_event,
                     trigger_on_voice=self.trigger_var.get(),
@@ -257,13 +284,19 @@ class RecorderApp(tk.Tk):
             if output_path.exists():
                 self.log_queue.put(f"输出文件：{output_path}\n")
             else:
-                self.log_queue.put("未检测到符合 30° / 0.5 米条件的人声，未生成 WAV 文件。\n")
+                self.log_queue.put("未检测到符合 30° 方向的人声，未生成 WAV 文件。\n")
             self.log_queue.put(f"采集时长：{captured_sec:.2f} 秒\n")
             self.log_queue.put(f"保存时长：{saved_sec:.2f} 秒\n")
             self.log_queue.put(f"Peak RMS：{stats.peak_rms:.4f}\n")
+            if stats.doa_samples:
+                self.log_queue.put(
+                    f"DOA 平均值：{sum(stats.doa_samples) / len(stats.doa_samples):.1f}°，"
+                    f"样本数：{len(stats.doa_samples)}\n"
+                )
             if stats.doa_rejects or stats.energy_rejects:
                 self.log_queue.put(f"DOA 拒绝块数：{stats.doa_rejects}\n")
                 self.log_queue.put(f"能量拒绝块数：{stats.energy_rejects}\n")
+                self.log_queue.put(f"波束比拒绝块数：{stats.ratio_rejects}\n")
 
             if self.playback_var.get() and output_path.exists():
                 status = self._playback(output_path)

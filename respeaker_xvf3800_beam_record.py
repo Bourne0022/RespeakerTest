@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import array
 import math
+import pathlib
 import platform
 import queue
 import struct
@@ -91,8 +92,8 @@ DEFAULT_HOLD_MS = 400.0
 # ---------------------------------------------------------------------------
 
 PARAMETERS = {
-    "AEC_FIXEDBEAMSAZIMUTH_VALUES":  (33, 81, 4, "rw", "radians"),
-    "AEC_FIXEDBEAMSELEVATION_VALUES": (33, 82, 4, "rw", "radians"),
+    "AEC_FIXEDBEAMSAZIMUTH_VALUES":  (33, 81, 2, "rw", "radians"),
+    "AEC_FIXEDBEAMSELEVATION_VALUES": (33, 82, 2, "rw", "radians"),
     "AEC_FIXEDBEAMSONOFF":           (33, 37, 1, "rw", "int32"),
     "AEC_FIXEDBEAMSGATING":          (33, 83, 1, "rw", "uint8"),
     "AUDIO_MGR_OP_L":                (35, 15, 2, "rw", "uint8"),
@@ -100,6 +101,7 @@ PARAMETERS = {
     "AEC_AZIMUTH_VALUES":            (33, 75, 4, "ro", "radians"),
     "AEC_SPENERGY_VALUES":           (33, 80, 4, "ro", "float"),
     "AUDIO_MGR_SELECTED_AZIMUTHS":   (35, 11, 2, "ro", "radians"),
+    "DOA_VALUE":                     (20, 18, 2, "ro", "uint16"),
     "AEC_MIC_ARRAY_TYPE":            (33, 73, 1, "ro", "int32"),
 }
 
@@ -240,6 +242,10 @@ class SpatialMonitor:
         ``None`` disables the energy gate.
     energy_tolerance : float
         Allowed fractional drop below *ref_energy* (0.0 – 1.0).
+    ratio_threshold : float
+        Minimum beam power ratio E0/(E0+E1) for angle verification.
+        Sound aligned with beam 0 produces ratio near 1.0; off-axis sound
+        leaks into beam 1 and drops the ratio.
     """
 
     def __init__(
@@ -249,16 +255,21 @@ class SpatialMonitor:
         angle_tolerance_deg: float,
         ref_energy: Optional[float],
         energy_tolerance: float,
+        ratio_threshold: float = 0.30,
     ) -> None:
         self._ctrl = ctrl
         self.target_angle = target_angle_deg
         self.angle_tolerance = angle_tolerance_deg
         self.ref_energy = ref_energy
         self.energy_tolerance = energy_tolerance
+        self.ratio_threshold = ratio_threshold
 
         self._lock = threading.Lock()
         self._latest_doa: Optional[float] = None       # radians or NaN
-        self._latest_energy: Optional[float] = None     # beam-0 speech energy
+        self._latest_energy0: Optional[float] = None    # beam-0 (target) speech energy
+        self._latest_energy1: Optional[float] = None    # beam-1 (opposite) speech energy
+        self._latest_energy2: Optional[float] = None    # beam-2 (target+90°) speech energy
+        self._latest_energy3: Optional[float] = None    # beam-3 (target-90°) speech energy
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -290,9 +301,12 @@ class SpatialMonitor:
                 energy_vals = self._ctrl.read(
                     "AEC_SPENERGY_VALUES", retry=True, max_retries=5
                 )
-                if energy_vals is not None and len(energy_vals) >= 1:
+                if energy_vals is not None and len(energy_vals) >= 4:
                     with self._lock:
-                        self._latest_energy = energy_vals[0]
+                        self._latest_energy0 = energy_vals[0]
+                        self._latest_energy1 = energy_vals[1]
+                        self._latest_energy2 = energy_vals[2]
+                        self._latest_energy3 = energy_vals[3]
             except Exception:
                 pass
 
@@ -301,20 +315,29 @@ class SpatialMonitor:
     # -- main-loop API --------------------------------------------------------
 
     def check(self):
-        """Return ``(doa_ok, energy_ok, doa_deg, energy)``.
+        """Return ``(doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio)``.
 
-        *doa_deg* is ``None`` when no valid DOA has been read yet;
-        *energy* is ``None`` when no speech-energy reading is available.
-        Both gates default to ``True`` when data is unavailable so that
-        the filter never discards audio because of a transient read failure.
+        *doa_deg* is ``None`` when no valid DOA has been read yet.
+        *energy* is E0 (target beam speech energy), ``None`` when unavailable.
+        *ratio* is the 4-beam focus ratio E0/sum(E0..E3), ``None`` when
+        fewer than 4 energy values are available.
+
+        All gates default to ``True`` when data is unavailable so that
+        transient read failures never discard audio.
         """
         with self._lock:
             doa = self._latest_doa
-            energy = self._latest_energy
+            e0 = self._latest_energy0
+            e1 = self._latest_energy1
+            e2 = self._latest_energy2
+            e3 = self._latest_energy3
 
         doa_ok = True
         energy_ok = True
+        ratio_ok = True
         doa_deg: Optional[float] = None
+        energy: Optional[float] = None
+        ratio: Optional[float] = None
 
         if doa is not None and not math.isnan(doa):
             doa_deg = math.degrees(doa)
@@ -323,18 +346,146 @@ class SpatialMonitor:
                 diff = 360.0 - diff
             doa_ok = diff <= self.angle_tolerance
 
-        if (
-            energy is not None
-            and self.ref_energy is not None
-            and self.ref_energy > 0.0
-        ):
-            # Distance filtering is implemented as a lower-bound energy gate:
-            # calibrate at 0.5 m, then accept the calibrated energy or louder.
-            # This accepts closer talkers and rejects quieter/farther talkers.
-            min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
-            energy_ok = energy >= min_energy
+        if e0 is not None:
+            energy = e0
+            # Energy gate: lower-bound using calibration reference at target distance.
+            if self.ref_energy is not None and self.ref_energy > 0.0:
+                min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
+                energy_ok = e0 >= min_energy
 
-        return doa_ok, energy_ok, doa_deg, energy
+            # 4-beam focus ratio + dominance check.
+            # Beam 0 (target) must dominate the side-guard beams (2, 3) and
+            # the total-energy focus ratio must meet the threshold.
+            if e1 is not None and e2 is not None and e3 is not None:
+                total = e0 + e1 + e2 + e3
+                if total > 0.0:
+                    ratio = e0 / total
+                    # Focus: E0 must hold at least ratio_threshold of total energy.
+                    # Dominance: E0 must be >= both side beams (2, 3).
+                    # (We don't require E0 >= E1 because E1 points backwards.)
+                    ratio_ok = (
+                        ratio >= self.ratio_threshold
+                        and e0 >= e2
+                        and e0 >= e3
+                    )
+
+        return doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio
+
+
+# ======================================================================
+# SpatialMonitor replacement: official DOA_VALUE voice + direction gate
+# ======================================================================
+
+class SpatialMonitor:
+    """Monitor official voice/DOA values without treating any sound as voice."""
+
+    def __init__(
+        self,
+        ctrl: ReSpeakerControl,
+        target_angle_deg: float,
+        angle_tolerance_deg: float,
+        ref_energy: Optional[float],
+        energy_tolerance: float,
+        ratio_threshold: float = 0.0,
+    ) -> None:
+        self._ctrl = ctrl
+        self.target_angle = target_angle_deg
+        self.angle_tolerance = angle_tolerance_deg
+        self.ref_energy = ref_energy
+        self.energy_tolerance = energy_tolerance
+        self.ratio_threshold = ratio_threshold
+
+        self._lock = threading.Lock()
+        self._latest_doa_deg: Optional[float] = None
+        self._latest_speech: Optional[bool] = None
+        self._latest_energy0: Optional[float] = None
+        self._latest_energy1: Optional[float] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self, interval: float = 0.20) -> None:
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._poll, args=(interval,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _poll(self, interval: float) -> None:
+        while self._running:
+            doa_value_ok = False
+            try:
+                doa_value = self._ctrl.read("DOA_VALUE", retry=True, max_retries=5)
+                if doa_value is not None and len(doa_value) >= 2:
+                    with self._lock:
+                        self._latest_doa_deg = float(int(doa_value[0]) % 360)
+                        self._latest_speech = bool(int(doa_value[1]))
+                    doa_value_ok = True
+            except Exception:
+                pass
+
+            if not doa_value_ok:
+                try:
+                    doa_vals = self._ctrl.read(
+                        "AUDIO_MGR_SELECTED_AZIMUTHS", retry=True, max_retries=5
+                    )
+                    if doa_vals is not None and len(doa_vals) >= 1:
+                        doa_rad = doa_vals[0]
+                        if doa_rad is not None and not math.isnan(doa_rad):
+                            with self._lock:
+                                self._latest_doa_deg = math.degrees(doa_rad) % 360.0
+                except Exception:
+                    pass
+
+            try:
+                energy_vals = self._ctrl.read(
+                    "AEC_SPENERGY_VALUES", retry=True, max_retries=5
+                )
+                if energy_vals is not None and len(energy_vals) >= 2:
+                    with self._lock:
+                        self._latest_energy0 = energy_vals[0]
+                        self._latest_energy1 = energy_vals[1]
+            except Exception:
+                pass
+
+            time.sleep(interval)
+
+    def check(self):
+        """Return speech/angle/energy/focus verdicts for the latest readings."""
+        with self._lock:
+            doa_deg = self._latest_doa_deg
+            speech = self._latest_speech
+            e0 = self._latest_energy0
+            e1 = self._latest_energy1
+
+        speech_ok = bool(speech)
+        doa_ok = False
+        energy_ok = True
+        ratio_ok = True
+        energy: Optional[float] = None
+        ratio: Optional[float] = None
+
+        if doa_deg is not None:
+            diff = abs(doa_deg - self.target_angle)
+            if diff > 180.0:
+                diff = 360.0 - diff
+            doa_ok = diff <= self.angle_tolerance
+
+        if e0 is not None:
+            energy = e0
+            if self.ref_energy is not None and self.ref_energy > 0.0:
+                min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
+                energy_ok = e0 >= min_energy
+
+            if self.ratio_threshold > 0.0 and e1 is not None:
+                total = e0 + e1
+                if total > 0.0:
+                    ratio = e0 / total
+                    ratio_ok = ratio >= self.ratio_threshold
+
+        return speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio
 
 
 # ======================================================================
@@ -367,6 +518,10 @@ def _load_calibration(path: str) -> dict:
     with open(path, "r") as fh:
         return _json.load(fh)
 
+# ======================================================================
+# ReSpeakerControl – minimal XVF3800 USB parameter read/write
+# ======================================================================
+
 def _float_from_bytes(data: bytes) -> float:
     """Unpack a little-endian IEEE-754 float from 4 bytes."""
     return struct.unpack("<f", data)[0]
@@ -375,11 +530,6 @@ def _float_from_bytes(data: bytes) -> float:
 def _float_to_bytes(value: float) -> bytes:
     """Pack a float into 4 little-endian bytes."""
     return struct.pack("<f", value)
-
-
-# ======================================================================
-# ReSpeakerControl – minimal XVF3800 USB parameter read/write
-# ======================================================================
 
 class ReSpeakerControl:
     """Minimal USB control wrapper for the XVF3800.
@@ -721,13 +871,19 @@ class RecordStats:
     received_frames: int = 0
     saved_frames: int = 0
     peak_rms: float = 0.0
+    speech_rejects: int = 0
     doa_rejects: int = 0
     energy_rejects: int = 0
+    ratio_rejects: int = 0
+    speech_samples: int = 0
     doa_samples: list[float] = None  # type: ignore[assignment]
+    energy_samples: list[float] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.doa_samples is None:
             self.doa_samples = []
+        if self.energy_samples is None:
+            self.energy_samples = []
 
 
 # ======================================================================
@@ -748,12 +904,17 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
 
     beam_rad = _radians(beam_deg)
     opposite_rad = _radians((beam_deg + 180.0) % 360.0)
+    side1_rad = _radians((beam_deg + 90.0) % 360.0)
+    side2_rad = _radians((beam_deg - 90.0) % 360.0)
 
     print(f"Configuring fixed beam: azimuth={beam_deg:.1f}°, elevation=0°")
-    print(f"  Beam 1 → {beam_deg:.1f}°  |  Beam 2 → {(beam_deg + 180) % 360:.1f}° (opposite)")
+    print(f"  Beam 0 → {beam_deg:.1f}° (target, audio out)")
+    print(f"  Beam 1 → {(beam_deg + 180) % 360:.1f}° (opposite)")
+    print(f"  Beam 2 → {(beam_deg + 90) % 360:.1f}° (side guard)")
+    print(f"  Beam 3 → {(beam_deg - 90) % 360:.1f}° (side guard)")
 
-    # -- write beam parameters (4 beams: primary, opposite, 2 unused) ---------
-    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad, 0.0, 0.0])
+    # -- write beam parameters (4 beams: target, opposite, +90°, -90°) --------
+    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad, side1_rad, side2_rad])
     ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0, 0.0, 0.0])
     ctrl.write("AEC_FIXEDBEAMSGATING", [0])           # disable per-beam gating
     ctrl.write("AEC_FIXEDBEAMSONOFF", [1])             # enable fixed-beam mode
@@ -790,12 +951,16 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
     except RuntimeError:
         op_l = None
 
-    if azimuths is not None and len(azimuths) >= 2:
+    if azimuths is not None and len(azimuths) >= 4:
+        az_ok = all(abs(a - e) < 0.1 for a, e in zip(azimuths, [beam_rad, opposite_rad, side1_rad, side2_rad]))
+    elif azimuths is not None and len(azimuths) >= 2:
         az_ok = all(abs(a - e) < 0.1 for a, e in zip(azimuths[:2], [beam_rad, opposite_rad]))
     else:
         az_ok = True  # can't verify, assume OK
 
-    if elevations is not None and len(elevations) >= 2:
+    if elevations is not None and len(elevations) >= 4:
+        el_ok = all(abs(e) < 0.1 for e in elevations[:4])
+    elif elevations is not None and len(elevations) >= 2:
         el_ok = all(abs(e) < 0.1 for e in elevations[:2])
     else:
         el_ok = True
@@ -804,10 +969,10 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
     route_ok = (op_l == (6, 0)) if op_l is not None else True
 
     if not az_ok:
-        print(f"  WARNING: azimuth mismatch – wrote {[beam_rad, opposite_rad]}, "
+        print(f"  WARNING: azimuth mismatch – wrote {[beam_rad, opposite_rad, side1_rad, side2_rad]}, "
               f"read {azimuths}", file=sys.stderr)
     if not el_ok:
-        print(f"  WARNING: elevation mismatch – wrote [0.0, 0.0], "
+        print(f"  WARNING: elevation mismatch – wrote [0.0, 0.0, 0.0, 0.0], "
               f"read {elevations}", file=sys.stderr)
     if not en_ok:
         print(f"  WARNING: fixed-beam mode may be OFF "
@@ -830,6 +995,81 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
 
 
 # ======================================================================
+# Official 2-beam fixed-beam configuration
+# ======================================================================
+
+def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
+    """Configure the official two fixed beams and route target beam to USB L."""
+
+    beam_rad = _radians(beam_deg)
+    opposite_rad = _radians((beam_deg + 180.0) % 360.0)
+
+    print(f"Configuring fixed beam: azimuth={beam_deg:.1f}°, elevation=0°")
+    print(f"  Beam 0 -> {beam_deg:.1f}° (target, audio out)")
+    print(f"  Beam 1 -> {(beam_deg + 180.0) % 360.0:.1f}° (opposite)")
+
+    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad])
+    ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0])
+    ctrl.write("AEC_FIXEDBEAMSGATING", [1])
+    ctrl.write("AEC_FIXEDBEAMSONOFF", [1])
+    ctrl.write("AUDIO_MGR_OP_L", [6, 0])
+    ctrl.write("AUDIO_MGR_OP_R", [0, 0])
+
+    try:
+        azimuths = ctrl.read("AEC_FIXEDBEAMSAZIMUTH_VALUES", retry=True, max_retries=10)
+    except RuntimeError:
+        azimuths = None
+    try:
+        elevations = ctrl.read("AEC_FIXEDBEAMSELEVATION_VALUES", retry=True, max_retries=10)
+    except RuntimeError:
+        elevations = None
+    try:
+        enabled = ctrl.read("AEC_FIXEDBEAMSONOFF", retry=True, max_retries=10)
+    except RuntimeError:
+        enabled = None
+    try:
+        gating = ctrl.read("AEC_FIXEDBEAMSGATING", retry=True, max_retries=10)
+    except RuntimeError:
+        gating = None
+    try:
+        op_l = ctrl.read("AUDIO_MGR_OP_L", retry=True, max_retries=10)
+    except RuntimeError:
+        op_l = None
+
+    az_ok = True
+    if azimuths is not None and len(azimuths) >= 2:
+        az_ok = all(abs(a - e) < 0.1 for a, e in zip(azimuths[:2], [beam_rad, opposite_rad]))
+    el_ok = True
+    if elevations is not None and len(elevations) >= 2:
+        el_ok = all(abs(e) < 0.1 for e in elevations[:2])
+    en_ok = (enabled == (1,)) if enabled is not None else True
+    gating_ok = (gating == (1,)) if gating is not None else True
+    route_ok = (op_l == (6, 0)) if op_l is not None else True
+
+    if not az_ok:
+        print(f"  WARNING: azimuth mismatch - wrote {[beam_rad, opposite_rad]}, read {azimuths}", file=sys.stderr)
+    if not el_ok:
+        print(f"  WARNING: elevation mismatch - wrote [0.0, 0.0], read {elevations}", file=sys.stderr)
+    if not en_ok:
+        print(f"  WARNING: fixed-beam mode may be OFF (read AEC_FIXEDBEAMSONOFF={enabled})", file=sys.stderr)
+    if not gating_ok:
+        print(f"  WARNING: fixed-beam gating may be OFF (read AEC_FIXEDBEAMSGATING={gating})", file=sys.stderr)
+    if not route_ok:
+        print(f"  WARNING: audio routing mismatch - wrote [6, 0], read {op_l}", file=sys.stderr)
+
+    if az_ok and el_ok and en_ok and gating_ok and route_ok:
+        print("  Beam configuration verified OK.")
+
+    try:
+        doa = ctrl.read("DOA_VALUE", retry=True, max_retries=5)
+        sp = ctrl.read("AEC_SPENERGY_VALUES", retry=True, max_retries=5)
+        print(f"  DOA_VALUE         : {doa}  (angle_deg, speech_flag)")
+        print(f"  AEC_SPENERGY_VALUES: {sp}")
+    except RuntimeError:
+        pass
+
+
+# ======================================================================
 # Main recording routine
 # ======================================================================
 
@@ -844,6 +1084,7 @@ def record(
     angle_tolerance_deg: float = 25.0,
     ref_energy: Optional[float] = None,
     energy_tolerance: float = 0.5,
+    ratio_threshold: float = 0.30,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
     trigger_on_voice: bool = False,
@@ -944,15 +1185,16 @@ def record(
                 angle_tolerance_deg=angle_tolerance_deg,
                 ref_energy=ref_energy,
                 energy_tolerance=energy_tolerance,
+                ratio_threshold=ratio_threshold,
             )
             spatial.start(interval=0.25)
             if ref_energy is not None:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
                       f"energy >= {(1.0 - energy_tolerance) * 100:.0f}% of ref "
-                      f"(ref={ref_energy:.6f})")
+                      f"(ref={ref_energy:.1f})  |  focus >= {ratio_threshold:.2f}")
             else:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"energy gate DISABLED (no calibration)")
+                      f"energy gate DISABLED  |  focus >= {ratio_threshold:.2f}")
 
         # ---- 5. keyboard listener (daemon thread) -------------------------
         if stop_event is None:
@@ -983,7 +1225,10 @@ def record(
         print(f"Beam azimuth  : {beam_deg:.1f}°")
         print(f"RMS threshold : {rms_threshold:.4f}  "
               f"(attack={attack_ms:.0f} ms, hold={hold_ms:.0f} ms)")
-        print(f"Max duration  : {duration_sec:.1f} s")
+        if duration_sec > 0:
+            print(f"Max duration  : {duration_sec:.1f} s")
+        else:
+            print("Max duration  : unlimited")
         if keyboard_stop_enabled:
             print("Press any key to stop early.\n")
         else:
@@ -1016,7 +1261,7 @@ def record(
                     break
 
                 elapsed = time.monotonic() - t_start
-                if elapsed >= duration_sec:
+                if duration_sec > 0 and elapsed >= duration_sec:
                     print(f"\nReached max duration ({duration_sec:.1f} s).")
                     break
 
@@ -1035,17 +1280,22 @@ def record(
                     stats.peak_rms = level
 
                 if gate.update(level):
-                    # -- spatial filter (DOA + energy) --
+                    # -- spatial filter (DOA + energy + ratio) --
                     write_chunk = True
                     if spatial is not None:
-                        doa_ok, energy_ok, doa_deg, energy = spatial.check()
+                        doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio = spatial.check()
                         if doa_deg is not None:
                             stats.doa_samples.append(doa_deg)
+                        if energy is not None:
+                            stats.energy_samples.append(energy)
                         if not doa_ok:
                             stats.doa_rejects += 1
                             write_chunk = False
                         if not energy_ok:
                             stats.energy_rejects += 1
+                            write_chunk = False
+                        if not ratio_ok:
+                            stats.ratio_rejects += 1
                             write_chunk = False
 
                     if write_chunk:
@@ -1068,12 +1318,15 @@ def record(
                         f"gate={state}",
                     ]
                     if spatial is not None:
-                        doa_ok, energy_ok, doa_deg, _ = spatial.check()
+                        doa_ok, energy_ok, ratio_ok, doa_deg, energy_val, ratio_val = spatial.check()
                         if doa_deg is not None:
                             tag = "OK" if doa_ok else "OFF-AXIS"
                             parts.append(f"  DOA={doa_deg:.1f}° {tag}")
                         else:
                             parts.append("  DOA=--")
+                        if ratio_val is not None:
+                            tag = "OK" if ratio_ok else "LOW"
+                            parts.append(f"  focus={ratio_val:.2f} {tag}")
                         parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
                     else:
                         parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
@@ -1097,6 +1350,219 @@ def record(
 
     if trigger_on_voice and stats.saved_frames == 0:
         print("未检测到符合条件的人声，未生成 WAV 文件。", file=sys.stderr)
+
+    return stats
+
+
+# ======================================================================
+# Voice-first recording routine
+# ======================================================================
+
+def record(
+    output_path: str,
+    duration_sec: float = DEFAULT_DURATION_SEC,
+    rms_threshold: float = DEFAULT_RMS_THRESHOLD,
+    device_hint: Optional[str] = None,
+    beam_deg: float = DEFAULT_BEAM_AZIMUTH_DEG,
+    attack_ms: float = DEFAULT_ATTACK_MS,
+    hold_ms: float = DEFAULT_HOLD_MS,
+    angle_tolerance_deg: float = 25.0,
+    ref_energy: Optional[float] = None,
+    energy_tolerance: float = 0.5,
+    ratio_threshold: float = 0.0,
+    enable_spatial: bool = True,
+    stop_event: Optional[threading.Event] = None,
+    trigger_on_voice: bool = True,
+) -> RecordStats:
+    """Record chunks that pass device VAD, DOA and optional distance checks."""
+
+    dev = find_device()
+    if dev is None:
+        raise RuntimeError(
+            "No XVF3800 control device found (VID=0x2886 PID=0x001A). "
+            "Check USB connection and WinUSB/libusb access."
+        )
+
+    ctrl = ReSpeakerControl(dev)
+    spatial: Optional[SpatialMonitor] = None
+    wf: Optional[wave.Wave_write] = None
+    try:
+        configure_device(ctrl, beam_deg)
+
+        input_index = pick_input_device(device_hint)
+        if input_index is None:
+            devices = sd.query_devices()
+            details = "\n".join(
+                f"  [{i}] {d['name']} (inputs={d['max_input_channels']})"
+                for i, d in enumerate(devices)
+                if d["max_input_channels"] > 0
+            )
+            raise RuntimeError(f"No matching XVF3800 input device found.\n{details}")
+
+        dev_info = sd.query_devices(input_index)
+        print(f"Audio input : [{input_index}] {dev_info['name']}")
+        print(f"Sample rate : {SAMPLE_RATE} Hz | channels: {CHANNELS}")
+
+        gate = RmsGate(
+            threshold=rms_threshold,
+            block_size=BLOCKSIZE,
+            sample_rate=SAMPLE_RATE,
+            attack_ms=attack_ms,
+            hold_ms=hold_ms,
+        )
+
+        if enable_spatial:
+            spatial = SpatialMonitor(
+                ctrl=ctrl,
+                target_angle_deg=beam_deg,
+                angle_tolerance_deg=angle_tolerance_deg,
+                ref_energy=ref_energy,
+                energy_tolerance=energy_tolerance,
+                ratio_threshold=ratio_threshold,
+            )
+            spatial.start(interval=0.20)
+            dist_msg = "disabled" if ref_energy is None else f">= {(1.0 - energy_tolerance) * 100:.0f}% of ref"
+            ratio_msg = "disabled" if ratio_threshold <= 0.0 else f">= {ratio_threshold:.2f}"
+            print(
+                f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
+                f"distance energy {dist_msg} | focus {ratio_msg}"
+            )
+
+        if stop_event is None:
+            stop_event = threading.Event()
+        keyboard_stop_enabled = sys.stdin is not None and sys.stdin.isatty()
+        if keyboard_stop_enabled:
+            threading.Thread(target=_any_key_stop, args=(stop_event,), daemon=True).start()
+
+        q: queue.Queue[bytes] = queue.Queue(maxsize=64)
+        stats = RecordStats()
+        t_start = time.monotonic()
+        last_status_time = t_start
+
+        def callback(indata, frames, _time_info, status) -> None:
+            if status:
+                print(f"[audio] {status}", file=sys.stderr)
+            try:
+                q.put_nowait(bytes(indata))
+            except queue.Full:
+                pass
+
+        def ensure_wave_open() -> wave.Wave_write:
+            nonlocal wf
+            if wf is None:
+                wf = wave.open(output_path, "wb")
+                wf.setnchannels(1)
+                wf.setsampwidth(SAMPLE_WIDTH_BYTES)
+                wf.setframerate(SAMPLE_RATE)
+            return wf
+
+        if not trigger_on_voice:
+            ensure_wave_open()
+
+        print(f"\nRecording -> {output_path}")
+        print(f"Beam azimuth  : {beam_deg:.1f} deg")
+        print(f"RMS floor     : {rms_threshold:.4f} (attack={attack_ms:.0f} ms, hold={hold_ms:.0f} ms)")
+        if duration_sec > 0:
+            print(f"Max duration  : {duration_sec:.1f} s")
+        else:
+            print("Max duration  : unlimited")
+        if keyboard_stop_enabled:
+            print("Press any key to stop early.\n")
+
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            blocksize=BLOCKSIZE,
+            device=input_index,
+            callback=callback,
+        ):
+            while True:
+                if stop_event.is_set():
+                    print("\nStopped by user request.")
+                    break
+                elapsed = time.monotonic() - t_start
+                if duration_sec > 0 and elapsed >= duration_sec:
+                    print(f"\nReached max duration ({duration_sec:.1f} s).")
+                    break
+
+                try:
+                    chunk = q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                stats.received_chunks += 1
+                stats.received_frames += len(chunk) // (SAMPLE_WIDTH_BYTES * CHANNELS)
+
+                level = rms_int16_mono(chunk, channels=CHANNELS)
+                stats.peak_rms = max(stats.peak_rms, level)
+                rms_ok = gate.update(level)
+
+                speech_ok = True
+                doa_ok = True
+                energy_ok = True
+                ratio_ok = True
+                doa_deg = None
+                energy = None
+                focus = None
+
+                if spatial is not None:
+                    speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, focus = spatial.check()
+                    if speech_ok:
+                        stats.speech_samples += 1
+                    if doa_deg is not None:
+                        stats.doa_samples.append(doa_deg)
+                    if energy is not None:
+                        stats.energy_samples.append(energy)
+
+                write_chunk = rms_ok and speech_ok and doa_ok and energy_ok and ratio_ok
+                if rms_ok and spatial is not None:
+                    if not speech_ok:
+                        stats.speech_rejects += 1
+                    if not doa_ok:
+                        stats.doa_rejects += 1
+                    if not energy_ok:
+                        stats.energy_rejects += 1
+                    if not ratio_ok:
+                        stats.ratio_rejects += 1
+
+                if write_chunk:
+                    if trigger_on_voice and wf is None:
+                        ensure_wave_open()
+                        print("Detected qualifying 30 deg voice, starting WAV write.")
+                    mono = extract_mono_bytes(chunk, channels=CHANNELS)
+                    if wf is not None:
+                        wf.writeframesraw(mono)
+                        stats.saved_chunks += 1
+                        stats.saved_frames += len(mono) // SAMPLE_WIDTH_BYTES
+
+                now = time.monotonic()
+                if now - last_status_time >= 2.0:
+                    state = "OPEN" if gate.open else "CLOSED"
+                    parts = [
+                        f"  [{elapsed:5.1f}s] RMS={level:.4f} smoothed={gate.smoothed_rms:.4f}",
+                        f" rms_gate={state}",
+                    ]
+                    if spatial is not None:
+                        parts.append(f" speech={'YES' if speech_ok else 'no'}")
+                        parts.append(f" DOA={doa_deg:.1f}deg {'OK' if doa_ok else 'OFF'}" if doa_deg is not None else " DOA=--")
+                        if focus is not None:
+                            parts.append(f" focus={focus:.2f} {'OK' if ratio_ok else 'LOW'}")
+                    parts.append(f" saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
+                    print("".join(parts))
+                    last_status_time = now
+
+    except sd.PortAudioError as exc:
+        raise RuntimeError(f"Audio device error: {exc}") from exc
+    finally:
+        if spatial is not None:
+            spatial.stop()
+        if wf is not None:
+            wf.close()
+        ctrl.close()
+
+    if trigger_on_voice and stats.saved_frames == 0:
+        print("No qualifying 30 deg voice detected; WAV was not created.", file=sys.stderr)
 
     return stats
 
@@ -1168,7 +1634,11 @@ def parse_args():
         help="Allowed energy drop below reference as fraction 0–1 (default: 0.5)",
     )
     p.add_argument(
-        "--trigger-on-voice", action="store_true",
+        "--ratio-threshold", type=float, default=0.0,
+        help="Optional front/back focus ratio E0/(E0+E1); 0 disables it (default: 0)",
+    )
+    p.add_argument(
+        "--trigger-on-voice", action="store_true", default=True,
         help="Create the WAV only after the first RMS/DOA/energy-approved voice chunk",
     )
     p.add_argument(
@@ -1221,6 +1691,11 @@ def main() -> int:
     try:
         # -- calibration mode -----------------------------------------------
         if args.calibrate:
+            # Enable spatial so we can collect AEC_SPENERGY_VALUES readings.
+            # DOA and energy gates are effectively disabled (wide tolerance,
+            # no ref_energy) so all RMS-gated audio passes through while the
+            # background thread samples the device's speech energy.
+            import statistics
             stats = record(
                 output_path=args.output,
                 duration_sec=args.cal_duration,
@@ -1229,18 +1704,26 @@ def main() -> int:
                 beam_deg=args.beam_deg,
                 attack_ms=args.attack_ms,
                 hold_ms=args.hold_ms,
-                enable_spatial=False,  # no spatial filter during calibration
+                angle_tolerance_deg=180.0,     # disable DOA gate
+                ref_energy=None,                # disable energy gate
+                enable_spatial=True,            # collect speech energy samples
             )
             if stats.doa_samples:
-                import statistics
-                print(f"\n  DOA samples : {len(stats.doa_samples)}")
-                print(f"  DOA mean    : {statistics.mean(stats.doa_samples):.1f}°")
-            # For calibration, the ref energy comes from RMS, not speech energy
+                print(f"\n  DOA samples    : {len(stats.doa_samples)}")
+                print(f"  DOA mean       : {statistics.mean(stats.doa_samples):.1f}°")
+            if stats.energy_samples:
+                avg_energy = statistics.mean(stats.energy_samples)
+                print(f"  Energy samples : {len(stats.energy_samples)}")
+                print(f"  Energy mean    : {avg_energy:.1f}")
+            else:
+                print("\n  WARNING: No speech energy samples collected. "
+                      "Is the sound source active?")
+                avg_energy = 0.0
             _save_calibration(
                 args.cal_json,
                 target_angle_deg=args.beam_deg,
                 target_distance_m=args.target_distance,
-                ref_energy=stats.peak_rms,
+                ref_energy=avg_energy,
                 ref_rms=stats.peak_rms,
             )
             print("\nCalibration complete. Now run without --calibrate to use "
@@ -1259,6 +1742,7 @@ def main() -> int:
             angle_tolerance_deg=args.angle_tolerance,
             ref_energy=ref_energy,
             energy_tolerance=args.energy_tolerance,
+            ratio_threshold=args.ratio_threshold,
             enable_spatial=not args.no_spatial,
             trigger_on_voice=args.trigger_on_voice,
         )
@@ -1281,9 +1765,12 @@ def main() -> int:
     print(f"  Captured  : {recv_sec:.2f} s  ({stats.received_chunks} chunks)")
     print(f"  Saved     : {saved_sec:.2f} s  ({stats.saved_chunks} chunks, {ratio:.1f}%)")
     print(f"  Peak RMS  : {stats.peak_rms:.4f}")
-    if stats.doa_rejects or stats.energy_rejects:
+    if stats.speech_rejects or stats.doa_rejects or stats.energy_rejects or stats.ratio_rejects:
+        print(f"  Speech rejects: {stats.speech_rejects} chunks")
         print(f"  DOA rejects   : {stats.doa_rejects} chunks")
         print(f"  Energy rejects: {stats.energy_rejects} chunks")
+        print(f"  Ratio rejects : {stats.ratio_rejects} chunks")
+    print(f"  Speech samples: {stats.speech_samples}")
     if stats.doa_samples:
         import statistics
         doa_arr = stats.doa_samples

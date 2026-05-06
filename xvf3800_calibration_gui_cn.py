@@ -289,6 +289,7 @@ class CalibrationApp(tk.Tk):
                         hold_ms=hold,
                         enable_spatial=False,
                         stop_event=self.stop_event,
+                        trigger_on_voice=False,
                     )
 
                 if not wav_path.exists():
