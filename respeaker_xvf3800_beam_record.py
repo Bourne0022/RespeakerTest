@@ -19,6 +19,7 @@ the control interface.
 from __future__ import annotations
 
 import array
+from collections import deque
 import math
 import pathlib
 import platform
@@ -373,11 +374,16 @@ class SpatialMonitor:
 
 
 # ======================================================================
-# SpatialMonitor replacement: official DOA_VALUE voice + direction gate
+# SpatialMonitor: official DOA_VALUE voice + 4-beam focus check
 # ======================================================================
 
 class SpatialMonitor:
-    """Monitor official voice/DOA values without treating any sound as voice."""
+    """Monitor official voice/DOA values and beam-energy focus.
+
+    The recorder loop uses the instantaneous verdicts together with its own
+    attack/hold hysteresis. That keeps the target speech from getting chopped
+    while still rejecting sustained off-axis talkers.
+    """
 
     def __init__(
         self,
@@ -386,7 +392,7 @@ class SpatialMonitor:
         angle_tolerance_deg: float,
         ref_energy: Optional[float],
         energy_tolerance: float,
-        ratio_threshold: float = 0.0,
+        ratio_threshold: float = 0.30,
     ) -> None:
         self._ctrl = ctrl
         self.target_angle = target_angle_deg
@@ -400,6 +406,8 @@ class SpatialMonitor:
         self._latest_speech: Optional[bool] = None
         self._latest_energy0: Optional[float] = None
         self._latest_energy1: Optional[float] = None
+        self._latest_energy2: Optional[float] = None
+        self._latest_energy3: Optional[float] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -443,10 +451,12 @@ class SpatialMonitor:
                 energy_vals = self._ctrl.read(
                     "AEC_SPENERGY_VALUES", retry=True, max_retries=5
                 )
-                if energy_vals is not None and len(energy_vals) >= 2:
+                if energy_vals is not None and len(energy_vals) >= 4:
                     with self._lock:
                         self._latest_energy0 = energy_vals[0]
                         self._latest_energy1 = energy_vals[1]
+                        self._latest_energy2 = energy_vals[2]
+                        self._latest_energy3 = energy_vals[3]
             except Exception:
                 pass
 
@@ -459,6 +469,8 @@ class SpatialMonitor:
             speech = self._latest_speech
             e0 = self._latest_energy0
             e1 = self._latest_energy1
+            e2 = self._latest_energy2
+            e3 = self._latest_energy3
 
         speech_ok = bool(speech)
         doa_ok = False
@@ -479,11 +491,20 @@ class SpatialMonitor:
                 min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
                 energy_ok = e0 >= min_energy
 
-            if self.ratio_threshold > 0.0 and e1 is not None:
-                total = e0 + e1
-                if total > 0.0:
-                    ratio = e0 / total
-                    ratio_ok = ratio >= self.ratio_threshold
+            if (
+                e1 is not None
+                and e2 is not None
+                and e3 is not None
+                and (e0 + e1 + e2 + e3) > 0.0
+            ):
+                total = e0 + e1 + e2 + e3
+                ratio = e0 / total
+                if self.ratio_threshold > 0.0:
+                    ratio_ok = (
+                        ratio >= self.ratio_threshold
+                        and e0 >= e2
+                        and e0 >= e3
+                    )
 
         return speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio
 
@@ -1369,7 +1390,7 @@ def record(
     angle_tolerance_deg: float = 25.0,
     ref_energy: Optional[float] = None,
     energy_tolerance: float = 0.5,
-    ratio_threshold: float = 0.0,
+    ratio_threshold: float = 0.30,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
     trigger_on_voice: bool = True,
@@ -1427,6 +1448,22 @@ def record(
                 f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
                 f"distance energy {dist_msg} | focus {ratio_msg}"
             )
+
+        block_seconds = BLOCKSIZE / SAMPLE_RATE
+        spatial_attack_blocks = max(
+            2,
+            int(math.ceil((attack_ms / 1000.0) / block_seconds)),
+        )
+        spatial_hold_blocks = max(
+            1,
+            int(math.ceil((hold_ms / 1000.0) / block_seconds)),
+        )
+        pre_roll_chunks: deque[bytes] = deque(
+            maxlen=max(1, int(math.ceil(0.5 / block_seconds)))
+        )
+        spatial_open = not enable_spatial
+        spatial_pass_streak = 0
+        spatial_fail_streak = 0
 
         if stop_event is None:
             stop_event = threading.Event()
@@ -1493,6 +1530,7 @@ def record(
 
                 stats.received_chunks += 1
                 stats.received_frames += len(chunk) // (SAMPLE_WIDTH_BYTES * CHANNELS)
+                pre_roll_chunks.append(chunk)
 
                 level = rms_int16_mono(chunk, channels=CHANNELS)
                 stats.peak_rms = max(stats.peak_rms, level)
@@ -1505,6 +1543,7 @@ def record(
                 doa_deg = None
                 energy = None
                 focus = None
+                opened_this_chunk = False
 
                 if spatial is not None:
                     speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, focus = spatial.check()
@@ -1515,21 +1554,47 @@ def record(
                     if energy is not None:
                         stats.energy_samples.append(energy)
 
-                write_chunk = rms_ok and speech_ok and doa_ok and energy_ok and ratio_ok
-                if rms_ok and spatial is not None:
-                    if not speech_ok:
-                        stats.speech_rejects += 1
-                    if not doa_ok:
-                        stats.doa_rejects += 1
-                    if not energy_ok:
-                        stats.energy_rejects += 1
-                    if not ratio_ok:
-                        stats.ratio_rejects += 1
+                    instant_spatial_ok = speech_ok and doa_ok and energy_ok and ratio_ok
+                    if instant_spatial_ok:
+                        spatial_pass_streak += 1
+                        spatial_fail_streak = 0
+                    else:
+                        spatial_fail_streak += 1
+                        spatial_pass_streak = 0
 
-                if write_chunk:
+                    if not spatial_open and spatial_pass_streak >= spatial_attack_blocks:
+                        spatial_open = True
+                        opened_this_chunk = True
+                        if trigger_on_voice and wf is None:
+                            ensure_wave_open()
+                            print("Detected qualifying 30 deg voice, starting WAV write.")
+                        if wf is not None:
+                            while pre_roll_chunks:
+                                buffered = pre_roll_chunks.popleft()
+                                wf.writeframesraw(extract_mono_bytes(buffered, channels=CHANNELS))
+                                stats.saved_chunks += 1
+                                stats.saved_frames += len(buffered) // (SAMPLE_WIDTH_BYTES * CHANNELS)
+
+                    elif spatial_open and spatial_fail_streak >= spatial_hold_blocks:
+                        spatial_open = False
+
+                    if rms_ok and not instant_spatial_ok:
+                        if not speech_ok:
+                            stats.speech_rejects += 1
+                        if not doa_ok:
+                            stats.doa_rejects += 1
+                        if not energy_ok:
+                            stats.energy_rejects += 1
+                        if not ratio_ok:
+                            stats.ratio_rejects += 1
+
+                write_chunk = rms_ok and spatial_open
+
+                if write_chunk and not opened_this_chunk:
                     if trigger_on_voice and wf is None:
                         ensure_wave_open()
-                        print("Detected qualifying 30 deg voice, starting WAV write.")
+                        if spatial is None:
+                            print("Detected RMS-qualified audio, starting WAV write.")
                     mono = extract_mono_bytes(chunk, channels=CHANNELS)
                     if wf is not None:
                         wf.writeframesraw(mono)
@@ -1548,6 +1613,7 @@ def record(
                         parts.append(f" DOA={doa_deg:.1f}deg {'OK' if doa_ok else 'OFF'}" if doa_deg is not None else " DOA=--")
                         if focus is not None:
                             parts.append(f" focus={focus:.2f} {'OK' if ratio_ok else 'LOW'}")
+                        parts.append(f" spatial={'OPEN' if spatial_open else 'WAIT'}")
                     parts.append(f" saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
                     print("".join(parts))
                     last_status_time = now
@@ -1634,8 +1700,8 @@ def parse_args():
         help="Allowed energy drop below reference as fraction 0–1 (default: 0.5)",
     )
     p.add_argument(
-        "--ratio-threshold", type=float, default=0.0,
-        help="Optional front/back focus ratio E0/(E0+E1); 0 disables it (default: 0)",
+        "--ratio-threshold", type=float, default=0.30,
+        help="Optional focus ratio E0/sum(E0..E3); 0 disables it (default: 0.30)",
     )
     p.add_argument(
         "--trigger-on-voice", action="store_true", default=True,

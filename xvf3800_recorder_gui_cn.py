@@ -62,7 +62,7 @@ class RecorderApp(tk.Tk):
         self.calibration_var = tk.StringVar(value=str(self._app_dir() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
         self.angle_tolerance_var = tk.StringVar(value="25")
-        self.ratio_threshold_var = tk.StringVar(value="0.0")
+        self.ratio_threshold_var = tk.StringVar(value="0.30")
         self.status_var = tk.StringVar(value="就绪")
 
         self._build_ui()
