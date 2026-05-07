@@ -1163,10 +1163,11 @@ def record(
     """Record beamformed audio with optional spatial gating.
 
     Continuous mode (spatial_gating=False, default):
-      All audio passing the RMS gate is recorded.  The 30-degree fixed beam
-      naturally attenuates off-axis sound, and off-axis suppression further
-      attenuates frequencies where the opposite beam dominates.  Spatial
-      checks (DOA, energy ratio) are monitored for diagnostics only.
+      Audio must pass the RMS gate, the device VAD, and the calibrated
+      near-field RMS check.  The 30-degree fixed beam naturally attenuates
+      off-axis sound, and off-axis suppression further attenuates frequencies
+      where the opposite beam dominates.  DOA is used as soft attenuation, not
+      as a hard cut, so target speech is less likely to be chopped.
 
     Gated mode (spatial_gating=True):
       Only chunks whose DOA, speech energy, and beam-focus ratio pass the
@@ -1229,7 +1230,7 @@ def record(
             if spatial_gating:
                 print("Spatial mode : hard gate (failed spatial chunks are not written)")
             else:
-                print("Spatial mode : continuous + soft off-axis attenuation")
+                print("Spatial mode : VAD + distance gate, continuous DOA soft attenuation")
         if offaxis_suppression:
             print(
                 f"Off-axis suppression: enabled "
@@ -1401,6 +1402,11 @@ def record(
                                 stats.ratio_rejects += 1
                     else:
                         spatial_open = True  # continuous mode: always write
+                        if rms_ok and (not speech_ok or not energy_ok):
+                            if not speech_ok:
+                                stats.speech_rejects += 1
+                            if not energy_ok:
+                                stats.energy_rejects += 1
                         if offaxis_suppression:
                             desired_gain = soft_spatial_gain(
                                 doa_deg=doa_deg,
@@ -1417,6 +1423,8 @@ def record(
 
                 if spatial_gating:
                     write_chunk = rms_ok and spatial_open
+                elif spatial is not None:
+                    write_chunk = rms_ok and speech_ok and energy_ok
                 else:
                     write_chunk = rms_ok  # continuous: only RMS gate controls writing
 
