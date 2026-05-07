@@ -82,10 +82,12 @@ DEFAULT_HOLD_MS = 400.0
 DEFAULT_DENOISE = True
 DEFAULT_DENOISE_STRENGTH = 0.65
 DEFAULT_DENOISE_MIN_GAIN = 0.35
-DEFAULT_RATIO_THRESHOLD = 0.0
+DEFAULT_RATIO_THRESHOLD = 0.35
+DEFAULT_DISTANCE_RATIO = 0.70
 DEFAULT_OFFAXIS_SUPPRESSION = True
-DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.80
-DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.18
+DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.85
+DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.08
+DEFAULT_SOFT_SPATIAL_MIN_GAIN = 0.18
 
 # ---------------------------------------------------------------------------
 # XVF3800 USB control parameter table
@@ -96,12 +98,9 @@ DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.18
 #   https://github.com/respeaker/reSpeaker_XVF3800_USB_4MIC_ARRAY
 #
 # Note on value counts:
-#   The official SDK defines AEC_FIXEDBEAMSAZIMUTH_VALUES / _ELEVATION_VALUES
-#   with count=4 (supporting up to 4 fixed beams).  This script configures
-#   only 2 beams (primary + opposite), which matches the common use-case and
-#   has been verified with firmware v2.1+.  AUDIO_MGR_OP_L / _OP_R use
-#   count=2 (source index + option byte) as required by the DSP audio
-#   manager register layout.
+#   The official Python host SDK defines AEC_FIXEDBEAMSAZIMUTH_VALUES /
+#   _ELEVATION_VALUES with count=2 for fixed beam 1 and fixed beam 2.
+#   AUDIO_MGR_OP_L / _OP_R also use count=2, as a (category, source) pair.
 # ---------------------------------------------------------------------------
 
 PARAMETERS = {
@@ -229,163 +228,6 @@ class RmsGate:
 
 
 # ======================================================================
-# SpatialMonitor – DOA + energy-based spatial verification
-# ======================================================================
-
-class SpatialMonitor:
-    """Background DOA and speech-energy monitor for spatial filtering.
-
-    Reads ``AUDIO_MGR_SELECTED_AZIMUTHS`` and ``AEC_SPENERGY_VALUES``
-    from the XVF3800 on a background thread so the recording loop is
-    never blocked by USB control-transfer latency.
-
-    The main recording loop calls :meth:`check` to get the latest cached
-    readings and a pass/fail verdict.
-
-    Parameters
-    ----------
-    ctrl : ReSpeakerControl
-        Connected control interface (must stay open for the monitor's lifetime).
-    target_angle_deg : float
-        Expected DOA in degrees.
-    angle_tolerance_deg : float
-        Allowed deviation from *target_angle_deg*.
-    ref_energy : float or None
-        Reference speech energy from calibration at the target distance.
-        ``None`` disables the energy gate.
-    energy_tolerance : float
-        Allowed fractional drop below *ref_energy* (0.0 – 1.0).
-    ratio_threshold : float
-        Minimum beam power ratio E0/(E0+E1) for angle verification.
-        Sound aligned with beam 0 produces ratio near 1.0; off-axis sound
-        leaks into beam 1 and drops the ratio.
-    """
-
-    def __init__(
-        self,
-        ctrl: ReSpeakerControl,
-        target_angle_deg: float,
-        angle_tolerance_deg: float,
-        ref_energy: Optional[float],
-        energy_tolerance: float,
-        ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
-    ) -> None:
-        self._ctrl = ctrl
-        self.target_angle = target_angle_deg
-        self.angle_tolerance = angle_tolerance_deg
-        self.ref_energy = ref_energy
-        self.energy_tolerance = energy_tolerance
-        self.ratio_threshold = ratio_threshold
-
-        self._lock = threading.Lock()
-        self._latest_doa: Optional[float] = None       # radians or NaN
-        self._latest_energy0: Optional[float] = None    # beam-0 (target) speech energy
-        self._latest_energy1: Optional[float] = None    # beam-1 (opposite) speech energy
-        self._latest_energy2: Optional[float] = None    # beam-2 (target+90°) speech energy
-        self._latest_energy3: Optional[float] = None    # beam-3 (target-90°) speech energy
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-    # -- background thread ----------------------------------------------------
-
-    def start(self, interval: float = 0.25) -> None:
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._poll, args=(interval,), daemon=True
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._running = False
-
-    def _poll(self, interval: float) -> None:
-        while self._running:
-            try:
-                doa_vals = self._ctrl.read(
-                    "AUDIO_MGR_SELECTED_AZIMUTHS", retry=True, max_retries=5
-                )
-                if doa_vals is not None and len(doa_vals) >= 2:
-                    with self._lock:
-                        self._latest_doa = doa_vals[0]
-            except Exception:
-                pass
-
-            try:
-                energy_vals = self._ctrl.read(
-                    "AEC_SPENERGY_VALUES", retry=True, max_retries=5
-                )
-                if energy_vals is not None and len(energy_vals) >= 4:
-                    with self._lock:
-                        self._latest_energy0 = energy_vals[0]
-                        self._latest_energy1 = energy_vals[1]
-                        self._latest_energy2 = energy_vals[2]
-                        self._latest_energy3 = energy_vals[3]
-            except Exception:
-                pass
-
-            time.sleep(interval)
-
-    # -- main-loop API --------------------------------------------------------
-
-    def check(self):
-        """Return ``(doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio)``.
-
-        *doa_deg* is ``None`` when no valid DOA has been read yet.
-        *energy* is E0 (target beam speech energy), ``None`` when unavailable.
-        *ratio* is the 4-beam focus ratio E0/sum(E0..E3), ``None`` when
-        fewer than 4 energy values are available.
-
-        All gates default to ``True`` when data is unavailable so that
-        transient read failures never discard audio.
-        """
-        with self._lock:
-            doa = self._latest_doa
-            e0 = self._latest_energy0
-            e1 = self._latest_energy1
-            e2 = self._latest_energy2
-            e3 = self._latest_energy3
-
-        doa_ok = True
-        energy_ok = True
-        ratio_ok = True
-        doa_deg: Optional[float] = None
-        energy: Optional[float] = None
-        ratio: Optional[float] = None
-
-        if doa is not None and not math.isnan(doa):
-            doa_deg = math.degrees(doa)
-            diff = abs(doa_deg - self.target_angle)
-            if diff > 180.0:
-                diff = 360.0 - diff
-            doa_ok = diff <= self.angle_tolerance
-
-        if e0 is not None:
-            energy = e0
-            # Energy gate: lower-bound using calibration reference at target distance.
-            if self.ref_energy is not None and self.ref_energy > 0.0:
-                min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
-                energy_ok = e0 >= min_energy
-
-            # 4-beam focus ratio + dominance check.
-            # Beam 0 (target) must dominate the side-guard beams (2, 3) and
-            # the total-energy focus ratio must meet the threshold.
-            if e1 is not None and e2 is not None and e3 is not None:
-                total = e0 + e1 + e2 + e3
-                if total > 0.0:
-                    ratio = e0 / total
-                    # Focus: E0 must hold at least ratio_threshold of total energy.
-                    # Dominance: E0 must be >= both side beams (2, 3).
-                    # (We don't require E0 >= E1 because E1 points backwards.)
-                    ratio_ok = (
-                        ratio >= self.ratio_threshold
-                        and e0 >= e2
-                        and e0 >= e3
-                    )
-
-        return doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio
-
-
-# ======================================================================
 # SpatialMonitor: official DOA_VALUE voice + 4-beam focus check
 # ======================================================================
 
@@ -503,7 +345,8 @@ class SpatialMonitor:
                 energy_ok = rms_level >= min_energy
 
             if (
-                e1 is not None
+                e0 is not None
+                and e1 is not None
                 and e2 is not None
                 and e3 is not None
                 and (e0 + e1 + e2 + e3) > 0.0
@@ -844,18 +687,90 @@ def extract_mono_bytes(raw_bytes: bytes, channels: int = CHANNELS) -> bytes:
     return mono.tobytes()
 
 
+def apply_mono_gain(mono_bytes: bytes, gain: float) -> bytes:
+    """Apply a bounded gain to mono int16 PCM bytes."""
+
+    gain = max(0.0, min(1.0, float(gain)))
+    if gain >= 0.999 or not mono_bytes:
+        return mono_bytes
+
+    if np is not None:
+        samples = np.frombuffer(mono_bytes, dtype="<i2").astype(np.float32)
+        samples *= gain
+        return np.clip(samples, -32768, 32767).astype("<i2").tobytes()
+
+    samples = array.array("h")
+    samples.frombytes(mono_bytes)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for i, value in enumerate(samples):
+        samples[i] = int(max(-32768, min(32767, value * gain)))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
+
+
+def angle_distance_deg(a: float, b: float) -> float:
+    diff = abs((a % 360.0) - (b % 360.0))
+    return min(diff, 360.0 - diff)
+
+
+def soft_spatial_gain(
+    doa_deg: Optional[float],
+    target_deg: float,
+    angle_tolerance_deg: float,
+    speech_ok: bool,
+    focus: Optional[float],
+    ratio_threshold: float,
+) -> float:
+    """Return a soft attenuation gain for continuous mode.
+
+    This is not a hard gate.  It leaves target-direction speech untouched and
+    progressively turns down chunks whose official DOA is clearly off-axis.
+    That makes simultaneous off-axis speech less intelligible without cutting
+    the target speaker into short fragments when DOA briefly jitters.
+    """
+
+    if doa_deg is None or not speech_ok:
+        return 1.0
+
+    diff = angle_distance_deg(doa_deg, target_deg)
+    if diff <= angle_tolerance_deg:
+        return 1.0
+
+    span = max(1.0, 180.0 - angle_tolerance_deg)
+    offaxis = max(0.0, min(1.0, (diff - angle_tolerance_deg) / span))
+    gain = 1.0 - offaxis * (1.0 - DEFAULT_SOFT_SPATIAL_MIN_GAIN)
+
+    if diff >= 90.0:
+        gain = min(gain, 0.24)
+    if (
+        focus is not None
+        and ratio_threshold > 0.0
+        and focus < max(0.05, ratio_threshold * 0.60)
+    ):
+        gain = min(gain, 0.35)
+
+    return max(DEFAULT_SOFT_SPATIAL_MIN_GAIN, gain)
+
+
 def suppress_offaxis_bytes(
     raw_bytes: bytes,
     channels: int = CHANNELS,
     strength: float = DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH,
     min_gain: float = DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN,
 ) -> tuple[bytes, bool, float]:
-    """Return target-channel PCM with opposite/reference speech softened.
+    """Return target-channel PCM with off-axis speech aggressively suppressed.
 
-    The USB left channel is the target fixed beam. When enabled, the right
-    channel is routed to the opposite fixed beam and used only as a reference.
-    Frequencies that are stronger in the reference beam are attenuated in the
-    target beam; target-dominant frequencies are preserved.
+    Uses the stereo USB stream where left=target beam (30 deg) and
+    right=opposite beam (210 deg).  Three-band spectral subtraction:
+      - Low band  (90-500 Hz):  voice fundamentals — heaviest suppression
+      - Mid band  (500-2500 Hz): voice formants  — moderate suppression
+      - High band (2500-5000 Hz): consonants     — lighter suppression
+
+    Frequencies where the opposite beam is dominant are attenuated in the
+    target channel.  The suppression strength scales with the overall
+    opposite/target RMS ratio so on-axis speech is preserved.
     """
 
     if np is None or channels < 2 or strength <= 0.0:
@@ -875,7 +790,7 @@ def suppress_offaxis_bytes(
         return frames[:, 0].astype("<i2").tobytes(), False, ref_rms
 
     relative_ref = ref_rms / max(target_rms, 1e-6)
-    if relative_ref < 0.18:
+    if relative_ref < 0.15:
         return frames[:, 0].astype("<i2").tobytes(), False, ref_rms
 
     n = target.size
@@ -885,20 +800,46 @@ def suppress_offaxis_bytes(
     ref_mag = np.abs(ref_spec)
     freqs = np.fft.rfftfreq(n, d=1.0 / SAMPLE_RATE)
 
-    speech_band = (freqs >= 140.0) & (freqs <= 4200.0)
-    reference_share = ref_mag / (target_mag + ref_mag + 1e-8)
-    dominance = np.clip((reference_share - 0.52) / 0.40, 0.0, 1.0)
+    # Three frequency bands for voice
+    low_band = (freqs >= 90.0) & (freqs <= 500.0)
+    mid_band = (freqs > 500.0) & (freqs <= 2500.0)
+    high_band = (freqs > 2500.0) & (freqs <= 5000.0)
 
-    chunk_strength = min(max(strength, 0.0), 1.0)
-    if relative_ref < 0.75:
-        chunk_strength *= 0.55
-    elif relative_ref > 1.25:
-        chunk_strength = min(1.0, chunk_strength * 1.15)
+    # Reference share: how much of each frequency bin belongs to the opposite beam
+    reference_share = ref_mag / (target_mag + ref_mag + 1e-8)
+
+    # Dominance: 0 = target-dominant, 1 = reference-dominant.
+    # Lower trigger threshold (0.45) means suppression kicks in sooner.
+    dominance = np.clip((reference_share - 0.45) / 0.35, 0.0, 1.0)
+
+    # Adaptive strength: scale with relative RMS ratio.
+    # On-axis voice: relative_ref ≈ 0.2-0.5  →  little suppression
+    # Side voice:    relative_ref ≈ 0.6-1.0  →  moderate suppression
+    # Rear voice:    relative_ref ≈ 1.0-3.0  →  heavy suppression
+    base_strength = min(max(strength, 0.0), 1.0)
+    if relative_ref < 0.50:
+        strength_scale = 0.25
+    elif relative_ref < 0.75:
+        strength_scale = 0.55
+    elif relative_ref < 1.10:
+        strength_scale = 0.85
+    elif relative_ref < 1.60:
+        strength_scale = 1.00
+    else:
+        strength_scale = 1.15
+    effective_strength = min(1.0, base_strength * strength_scale)
+
+    # Build spectral gain with per-band floors.
+    # Lower floor = more aggressive suppression for that band.
+    speech_gain = 1.0 - effective_strength * dominance
+    low_floor = max(min_gain * 0.7, 0.04)
+    mid_floor = max(min_gain, 0.06)
+    high_floor = max(min_gain * 1.6, 0.12)
 
     gain = np.ones_like(target_mag, dtype=np.float32)
-    speech_gain = 1.0 - chunk_strength * dominance[speech_band]
-    speech_floor = min(max(min_gain, 0.05), 0.80)
-    gain[speech_band] = np.maximum(speech_gain, speech_floor)
+    gain[low_band] = np.maximum(speech_gain[low_band], low_floor)
+    gain[mid_band] = np.maximum(speech_gain[mid_band], mid_floor)
+    gain[high_band] = np.maximum(speech_gain[high_band], high_floor)
 
     cleaned = np.fft.irfft(target_spec * gain, n=n).astype(np.float32)
     peak_in = float(np.max(np.abs(target))) if target.size else 0.0
@@ -907,7 +848,7 @@ def suppress_offaxis_bytes(
         cleaned *= peak_in / peak_out
 
     pcm = np.clip(cleaned * 32767.0, -32768, 32767).astype("<i2")
-    suppressed = bool(np.any((dominance[speech_band] > 0.15) & (gain[speech_band] < 0.92)))
+    suppressed = bool(np.any((dominance > 0.10) & (speech_gain < 0.90)))
     return pcm.tobytes(), suppressed, ref_rms
 
 
@@ -1086,6 +1027,8 @@ class RecordStats:
     denoise_peak_rms: float = 0.0
     offaxis_suppressed_chunks: int = 0
     offaxis_reference_peak_rms: float = 0.0
+    spatial_attenuated_chunks: int = 0
+    spatial_min_gain: float = 1.0
     doa_samples: list[float] = None  # type: ignore[assignment]
     energy_samples: list[float] = None  # type: ignore[assignment]
 
@@ -1094,114 +1037,6 @@ class RecordStats:
             self.doa_samples = []
         if self.energy_samples is None:
             self.energy_samples = []
-
-
-# ======================================================================
-# Beam configuration with read-back verification
-# ======================================================================
-
-def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
-    """Configure fixed-beam mode and route beamformed audio to left channel.
-
-    After writing each parameter group the function reads the values back
-    and compares them, printing warnings on mismatch so the user can
-    diagnose configuration problems before recording starts.
-
-    Audio routing:
-      Left  channel → source 6 (beamformer output 0, the beam at *beam_deg*)
-      Right channel → source 0 (silence)
-    """
-
-    beam_rad = _radians(beam_deg)
-    opposite_rad = _radians((beam_deg + 180.0) % 360.0)
-    side1_rad = _radians((beam_deg + 90.0) % 360.0)
-    side2_rad = _radians((beam_deg - 90.0) % 360.0)
-
-    print(f"Configuring fixed beam: azimuth={beam_deg:.1f}°, elevation=0°")
-    print(f"  Beam 0 → {beam_deg:.1f}° (target, audio out)")
-    print(f"  Beam 1 → {(beam_deg + 180) % 360:.1f}° (opposite)")
-    print(f"  Beam 2 → {(beam_deg + 90) % 360:.1f}° (side guard)")
-    print(f"  Beam 3 → {(beam_deg - 90) % 360:.1f}° (side guard)")
-
-    # -- write beam parameters (4 beams: target, opposite, +90°, -90°) --------
-    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad, side1_rad, side2_rad])
-    ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0, 0.0, 0.0])
-    ctrl.write("AEC_FIXEDBEAMSGATING", [0])           # disable per-beam gating
-    ctrl.write("AEC_FIXEDBEAMSONOFF", [1])             # enable fixed-beam mode
-
-    # Route processed beamformer output to left channel; silence right.
-    ctrl.write("AUDIO_MGR_OP_L", [6, 0])
-    ctrl.write("AUDIO_MGR_OP_R", [0, 0])
-
-    # -- read-back verification ----------------------------------------------
-    try:
-        azimuths = ctrl.read("AEC_FIXEDBEAMSAZIMUTH_VALUES", retry=True, max_retries=10)
-    except RuntimeError:
-        # Read-back may fail on some firmware versions; the write usually
-        # succeeds anyway.  Fall back to the read-only azimuth register.
-        try:
-            azimuths = ctrl.read("AEC_AZIMUTH_VALUES", retry=True, max_retries=10)
-        except RuntimeError:
-            azimuths = None
-            print("  Note: could not read back azimuths (firmware busy) – "
-                  "writes typically succeed.", file=sys.stderr)
-
-    try:
-        elevations = ctrl.read("AEC_FIXEDBEAMSELEVATION_VALUES", retry=True, max_retries=10)
-    except RuntimeError:
-        elevations = None
-
-    try:
-        enabled = ctrl.read("AEC_FIXEDBEAMSONOFF", retry=True, max_retries=10)
-    except RuntimeError:
-        enabled = None
-
-    try:
-        op_l = ctrl.read("AUDIO_MGR_OP_L", retry=True, max_retries=10)
-    except RuntimeError:
-        op_l = None
-
-    if azimuths is not None and len(azimuths) >= 4:
-        az_ok = all(abs(a - e) < 0.1 for a, e in zip(azimuths, [beam_rad, opposite_rad, side1_rad, side2_rad]))
-    elif azimuths is not None and len(azimuths) >= 2:
-        az_ok = all(abs(a - e) < 0.1 for a, e in zip(azimuths[:2], [beam_rad, opposite_rad]))
-    else:
-        az_ok = True  # can't verify, assume OK
-
-    if elevations is not None and len(elevations) >= 4:
-        el_ok = all(abs(e) < 0.1 for e in elevations[:4])
-    elif elevations is not None and len(elevations) >= 2:
-        el_ok = all(abs(e) < 0.1 for e in elevations[:2])
-    else:
-        el_ok = True
-
-    en_ok = (enabled == (1,)) if enabled is not None else True
-    route_ok = (op_l == (6, 0)) if op_l is not None else True
-
-    if not az_ok:
-        print(f"  WARNING: azimuth mismatch – wrote {[beam_rad, opposite_rad, side1_rad, side2_rad]}, "
-              f"read {azimuths}", file=sys.stderr)
-    if not el_ok:
-        print(f"  WARNING: elevation mismatch – wrote [0.0, 0.0, 0.0, 0.0], "
-              f"read {elevations}", file=sys.stderr)
-    if not en_ok:
-        print(f"  WARNING: fixed-beam mode may be OFF "
-              f"(read AEC_FIXEDBEAMSONOFF={enabled})", file=sys.stderr)
-    if not route_ok:
-        print(f"  WARNING: audio routing mismatch – wrote [6, 0], "
-              f"read {op_l}", file=sys.stderr)
-
-    if az_ok and el_ok and en_ok and route_ok:
-        print("  Beam configuration verified OK.")
-
-    # -- optional diagnostics ------------------------------------------------
-    try:
-        ae = ctrl.read("AEC_AZIMUTH_VALUES")
-        sp = ctrl.read("AEC_SPENERGY_VALUES")
-        print(f"  AEC_AZIMUTH_VALUES : {ae}")
-        print(f"  AEC_SPENERGY_VALUES: {sp}")
-    except RuntimeError:
-        pass
 
 
 # ======================================================================
@@ -1298,290 +1133,6 @@ def configure_device(
         pass
 
 
-# ======================================================================
-# Main recording routine
-# ======================================================================
-
-def record(
-    output_path: str,
-    duration_sec: float = DEFAULT_DURATION_SEC,
-    rms_threshold: float = DEFAULT_RMS_THRESHOLD,
-    device_hint: Optional[str] = None,
-    beam_deg: float = DEFAULT_BEAM_AZIMUTH_DEG,
-    attack_ms: float = DEFAULT_ATTACK_MS,
-    hold_ms: float = DEFAULT_HOLD_MS,
-    angle_tolerance_deg: float = 25.0,
-    ref_rms: Optional[float] = None,
-    distance_ratio: float = 0.30,
-    ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
-    enable_spatial: bool = True,
-    stop_event: Optional[threading.Event] = None,
-    trigger_on_voice: bool = False,
-) -> RecordStats:
-    """Run the recording session.
-
-    Parameters
-    ----------
-    output_path : str
-        Path for the output mono WAV file (16 kHz int16).
-    duration_sec : float
-        Maximum recording duration in seconds.
-    rms_threshold : float
-        Normalised RMS threshold for the noise gate (0.0 – 1.0).
-    device_hint : str or None
-        Substring to match against audio input device names.
-    beam_deg : float
-        Fixed-beam azimuth in degrees.
-    attack_ms : float
-        Gate attack time in ms.
-    hold_ms : float
-        Gate hold time in ms.
-    angle_tolerance_deg : float
-        Allowed DOA deviation from *beam_deg* before a chunk is rejected.
-    ref_rms : float or None
-        Reference RMS from calibration at the target distance.  ``None``
-        disables the distance gate.
-    distance_ratio : float
-        Minimum fraction of *ref_rms* required to pass the distance gate.
-    enable_spatial : bool
-        When False the spatial monitor is not started (plain RMS-only gate).
-    stop_event : threading.Event or None
-        Optional external stop signal, used by GUI frontends.
-    trigger_on_voice : bool
-        When True, the WAV file is opened only after the first chunk that
-        passes the RMS/DOA/energy checks.  If no qualifying speech is seen,
-        no WAV file is created.
-
-    Returns
-    -------
-    RecordStats
-    """
-
-    # ---- 1. locate USB control device -------------------------------------
-    dev = find_device()
-    if dev is None:
-        raise RuntimeError(
-            "No XVF3800 control device found (VID=0x2886 PID=0x001A).\n"
-            "• Verify the microphone USB cable is connected.\n"
-            "• On Windows: install the libusb/WinUSB driver on the control\n"
-            "  interface using Zadig or the official ReSpeaker driver package.\n"
-            "• On Linux: check 'lsusb' and ensure you have rw permissions."
-        )
-
-    ctrl = ReSpeakerControl(dev)
-    spatial: Optional[SpatialMonitor] = None
-    wf: Optional[wave.Wave_write] = None
-    try:
-        # ---- 2. configure beam & routing ----------------------------------
-        configure_device(ctrl, beam_deg)
-
-        # ---- 3. select audio input device ---------------------------------
-        input_index = pick_input_device(device_hint)
-        if input_index is None:
-            devices = sd.query_devices()
-            details = "\n".join(
-                f"  [{i}] {d['name']}  "
-                f"(inputs={d['max_input_channels']}, sr={int(d['default_samplerate'])} Hz)"
-                for i, d in enumerate(devices)
-                if d["max_input_channels"] > 0
-            )
-            raise RuntimeError(
-                "No matching USB audio input device found.\n"
-                "Use --device-hint with a substring of the device name, "
-                "or pass an index via the environment variable "
-                "SD_INPUT_DEVICE_INDEX.\n\n"
-                f"Available input devices:\n{details}"
-            )
-
-        dev_info = sd.query_devices(input_index)
-        print(f"Audio input : [{input_index}] {dev_info['name']}")
-        print(f"Sample rate : {SAMPLE_RATE} Hz  |  channels: {CHANNELS} (stereo)")
-
-        # ---- 4. initialise RMS gate ---------------------------------------
-        gate = RmsGate(
-            threshold=rms_threshold,
-            block_size=BLOCKSIZE,
-            sample_rate=SAMPLE_RATE,
-            attack_ms=attack_ms,
-            hold_ms=hold_ms,
-        )
-
-        # ---- 4b. initialise spatial monitor (DOA + energy) ---------------
-        if enable_spatial:
-            spatial = SpatialMonitor(
-                ctrl=ctrl,
-                target_angle_deg=beam_deg,
-                angle_tolerance_deg=angle_tolerance_deg,
-                ref_rms=ref_rms,
-                distance_ratio=distance_ratio,
-                ratio_threshold=ratio_threshold,
-            )
-            spatial.start(interval=0.25)
-            if ref_rms is not None:
-                print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"RMS >= {distance_ratio * 100:.0f}% of ref "
-                      f"(ref={ref_rms:.4f})  |  focus >= {ratio_threshold:.2f}")
-            else:
-                print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"RMS gate DISABLED  |  focus >= {ratio_threshold:.2f}")
-
-        # ---- 5. keyboard listener (daemon thread) -------------------------
-        if stop_event is None:
-            stop_event = threading.Event()
-        keyboard_stop_enabled = sys.stdin is not None and sys.stdin.isatty()
-        if keyboard_stop_enabled:
-            kb_thread = threading.Thread(
-                target=_any_key_stop, args=(stop_event,), daemon=True
-            )
-            kb_thread.start()
-
-        # ---- 6. audio queue & callback ------------------------------------
-        q: queue.Queue[bytes] = queue.Queue(maxsize=64)
-        stats = RecordStats()
-        t_start = time.monotonic()
-        last_status_time = t_start
-
-        def callback(indata, frames, _time_info, status) -> None:
-            if status:
-                print(f"[audio] {status}", file=sys.stderr)
-            try:
-                q.put_nowait(bytes(indata))
-            except queue.Full:
-                pass  # drop the newest chunk when the main loop falls behind
-
-        # ---- 7. record ----------------------------------------------------
-        print(f"\nRecording → {output_path}")
-        print(f"Beam azimuth  : {beam_deg:.1f}°")
-        print(f"RMS threshold : {rms_threshold:.4f}  "
-              f"(attack={attack_ms:.0f} ms, hold={hold_ms:.0f} ms)")
-        if duration_sec > 0:
-            print(f"Max duration  : {duration_sec:.1f} s")
-        else:
-            print("Max duration  : unlimited")
-        if keyboard_stop_enabled:
-            print("Press any key to stop early.\n")
-        else:
-            print("Use the GUI stop button or an external stop signal to stop early.\n")
-
-        def _ensure_wave_open() -> wave.Wave_write:
-            nonlocal wf
-            if wf is None:
-                wf = wave.open(output_path, "wb")
-                wf.setnchannels(1)
-                wf.setsampwidth(SAMPLE_WIDTH_BYTES)
-                wf.setframerate(SAMPLE_RATE)
-            return wf
-
-        if not trigger_on_voice:
-            _ensure_wave_open()
-
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=BLOCKSIZE,
-            device=input_index,
-            callback=callback,
-        ):
-            while True:
-                # -- stop conditions --
-                if stop_event.is_set():
-                    print("\nStopped by user request.")
-                    break
-
-                elapsed = time.monotonic() - t_start
-                if duration_sec > 0 and elapsed >= duration_sec:
-                    print(f"\nReached max duration ({duration_sec:.1f} s).")
-                    break
-
-                # -- fetch next audio block --
-                try:
-                    chunk = q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                stats.received_chunks += 1
-                stats.received_frames += len(chunk) // (SAMPLE_WIDTH_BYTES * CHANNELS)
-
-                # -- RMS gate decision --
-                level = rms_int16_mono(chunk, channels=CHANNELS)
-                if level > stats.peak_rms:
-                    stats.peak_rms = level
-
-                if gate.update(level):
-                    # -- spatial filter (DOA + energy + ratio) --
-                    write_chunk = True
-                    if spatial is not None:
-                        doa_ok, energy_ok, ratio_ok, doa_deg, energy, ratio = spatial.check()
-                        if doa_deg is not None:
-                            stats.doa_samples.append(doa_deg)
-                        if energy is not None:
-                            stats.energy_samples.append(energy)
-                        if not doa_ok:
-                            stats.doa_rejects += 1
-                            write_chunk = False
-                        if not energy_ok:
-                            stats.energy_rejects += 1
-                            write_chunk = False
-                        if not ratio_ok:
-                            stats.ratio_rejects += 1
-                            write_chunk = False
-
-                    if write_chunk:
-                        if trigger_on_voice and wf is None:
-                            _ensure_wave_open()
-                            print("检测到符合条件的人声，开始写入 WAV。")
-                        mono = extract_mono_bytes(chunk, channels=CHANNELS)
-                        if wf is not None:
-                            wf.writeframesraw(mono)
-                            stats.saved_chunks += 1
-                            stats.saved_frames += len(mono) // SAMPLE_WIDTH_BYTES
-
-                # -- periodic status (every ~2 s) --
-                now = time.monotonic()
-                if now - last_status_time >= 2.0:
-                    state = "OPEN" if gate.open else "CLOSED"
-                    parts = [
-                        f"  [{elapsed:5.1f}s]  ",
-                        f"RMS={level:.4f} (smoothed={gate.smoothed_rms:.4f})  ",
-                        f"gate={state}",
-                    ]
-                    if spatial is not None:
-                        doa_ok, energy_ok, ratio_ok, doa_deg, energy_val, ratio_val = spatial.check()
-                        if doa_deg is not None:
-                            tag = "OK" if doa_ok else "OFF-AXIS"
-                            parts.append(f"  DOA={doa_deg:.1f}° {tag}")
-                        else:
-                            parts.append("  DOA=--")
-                        if ratio_val is not None:
-                            tag = "OK" if ratio_ok else "LOW"
-                            parts.append(f"  focus={ratio_val:.2f} {tag}")
-                        parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
-                    else:
-                        parts.append(f"  saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
-                    print("".join(parts))
-                    last_status_time = now
-
-    except KeyboardInterrupt:
-        print("\nRecording interrupted by Ctrl+C.", file=sys.stderr)
-    except sd.PortAudioError as exc:
-        raise RuntimeError(
-            f"Audio device error: {exc}\n"
-            "The USB audio device may have been disconnected or is in use "
-            "by another application."
-        ) from exc
-    finally:
-        if spatial is not None:
-            spatial.stop()
-        if wf is not None:
-            wf.close()
-        ctrl.close()
-
-    if trigger_on_voice and stats.saved_frames == 0:
-        print("未检测到符合条件的人声，未生成 WAV 文件。", file=sys.stderr)
-
-    return stats
-
 
 # ======================================================================
 # Voice-first recording routine
@@ -1598,17 +1149,29 @@ def record(
     angle_tolerance_deg: float = 25.0,
     ref_rms: Optional[float] = None,
     ref_energy: Optional[float] = None,
-    distance_ratio: float = 0.30,
+    distance_ratio: float = DEFAULT_DISTANCE_RATIO,
     ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
     enable_spatial: bool = True,
+    spatial_gating: bool = False,
     stop_event: Optional[threading.Event] = None,
-    trigger_on_voice: bool = True,
+    trigger_on_voice: bool = False,
     denoise: bool = DEFAULT_DENOISE,
     denoise_strength: float = DEFAULT_DENOISE_STRENGTH,
     offaxis_suppression: bool = DEFAULT_OFFAXIS_SUPPRESSION,
     offaxis_suppression_strength: float = DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH,
 ) -> RecordStats:
-    """Record chunks that pass device VAD, DOA and optional distance checks."""
+    """Record beamformed audio with optional spatial gating.
+
+    Continuous mode (spatial_gating=False, default):
+      All audio passing the RMS gate is recorded.  The 30-degree fixed beam
+      naturally attenuates off-axis sound, and off-axis suppression further
+      attenuates frequencies where the opposite beam dominates.  Spatial
+      checks (DOA, energy ratio) are monitored for diagnostics only.
+
+    Gated mode (spatial_gating=True):
+      Only chunks whose DOA, speech energy, and beam-focus ratio pass the
+      spatial checks are written to the WAV file.
+    """
 
     dev = find_device()
     if dev is None:
@@ -1663,6 +1226,10 @@ def record(
                 f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
                 f"distance RMS {dist_msg} | focus {ratio_msg}"
             )
+            if spatial_gating:
+                print("Spatial mode : hard gate (failed spatial chunks are not written)")
+            else:
+                print("Spatial mode : continuous + soft off-axis attenuation")
         if offaxis_suppression:
             print(
                 f"Off-axis suppression: enabled "
@@ -1695,10 +1262,19 @@ def record(
         stats = RecordStats()
         t_start = time.monotonic()
         last_status_time = t_start
+        spatial_soft_gain = 1.0
 
-        def output_mono_bytes(stereo_chunk: bytes) -> bytes:
+        def smooth_spatial_gain(desired_gain: float) -> float:
+            nonlocal spatial_soft_gain
+            desired_gain = max(DEFAULT_SOFT_SPATIAL_MIN_GAIN, min(1.0, desired_gain))
+            alpha = 0.45 if desired_gain < spatial_soft_gain else 0.75
+            spatial_soft_gain += (desired_gain - spatial_soft_gain) * alpha
+            return spatial_soft_gain
+
+        def output_mono_bytes(stereo_chunk: bytes, gain: float = 1.0) -> bytes:
             if not offaxis_suppression:
-                return extract_mono_bytes(stereo_chunk, channels=CHANNELS)
+                mono = extract_mono_bytes(stereo_chunk, channels=CHANNELS)
+                return apply_mono_gain(mono, gain)
             mono, suppressed, ref_rms = suppress_offaxis_bytes(
                 stereo_chunk,
                 channels=CHANNELS,
@@ -1707,7 +1283,7 @@ def record(
             stats.offaxis_reference_peak_rms = max(stats.offaxis_reference_peak_rms, ref_rms)
             if suppressed:
                 stats.offaxis_suppressed_chunks += 1
-            return mono
+            return apply_mono_gain(mono, gain)
 
         def callback(indata, frames, _time_info, status) -> None:
             if status:
@@ -1776,6 +1352,7 @@ def record(
                 doa_deg = None
                 energy = None
                 focus = None
+                chunk_spatial_gain = 1.0
                 opened_this_chunk = False
 
                 if spatial is not None:
@@ -1788,47 +1365,67 @@ def record(
                         stats.energy_samples.append(energy)
 
                     instant_spatial_ok = speech_ok and doa_ok and energy_ok and ratio_ok
-                    if instant_spatial_ok:
-                        spatial_pass_streak += 1
-                        spatial_fail_streak = 0
+
+                    if spatial_gating:
+                        if instant_spatial_ok:
+                            spatial_pass_streak += 1
+                            spatial_fail_streak = 0
+                        else:
+                            spatial_fail_streak += 1
+                            spatial_pass_streak = 0
+
+                        if not spatial_open and spatial_pass_streak >= spatial_attack_blocks:
+                            spatial_open = True
+                            opened_this_chunk = True
+                            if trigger_on_voice and wf is None:
+                                ensure_wave_open()
+                                print("Detected qualifying 30 deg voice, starting WAV write.")
+                            if wf is not None:
+                                while pre_roll_chunks:
+                                    buffered = pre_roll_chunks.popleft()
+                                    wf.writeframesraw(output_mono_bytes(buffered))
+                                    stats.saved_chunks += 1
+                                    stats.saved_frames += len(buffered) // (SAMPLE_WIDTH_BYTES * CHANNELS)
+
+                        elif spatial_open and spatial_fail_streak >= spatial_hold_blocks:
+                            spatial_open = False
+
+                        if rms_ok and not instant_spatial_ok:
+                            if not speech_ok:
+                                stats.speech_rejects += 1
+                            if not doa_ok:
+                                stats.doa_rejects += 1
+                            if not energy_ok:
+                                stats.energy_rejects += 1
+                            if not ratio_ok:
+                                stats.ratio_rejects += 1
                     else:
-                        spatial_fail_streak += 1
-                        spatial_pass_streak = 0
+                        spatial_open = True  # continuous mode: always write
+                        if offaxis_suppression:
+                            desired_gain = soft_spatial_gain(
+                                doa_deg=doa_deg,
+                                target_deg=beam_deg,
+                                angle_tolerance_deg=angle_tolerance_deg,
+                                speech_ok=speech_ok,
+                                focus=focus,
+                                ratio_threshold=ratio_threshold,
+                            )
+                            chunk_spatial_gain = smooth_spatial_gain(desired_gain)
+                            if chunk_spatial_gain < 0.98:
+                                stats.spatial_attenuated_chunks += 1
+                                stats.spatial_min_gain = min(stats.spatial_min_gain, chunk_spatial_gain)
 
-                    if not spatial_open and spatial_pass_streak >= spatial_attack_blocks:
-                        spatial_open = True
-                        opened_this_chunk = True
-                        if trigger_on_voice and wf is None:
-                            ensure_wave_open()
-                            print("Detected qualifying 30 deg voice, starting WAV write.")
-                        if wf is not None:
-                            while pre_roll_chunks:
-                                buffered = pre_roll_chunks.popleft()
-                                wf.writeframesraw(output_mono_bytes(buffered))
-                                stats.saved_chunks += 1
-                                stats.saved_frames += len(buffered) // (SAMPLE_WIDTH_BYTES * CHANNELS)
-
-                    elif spatial_open and spatial_fail_streak >= spatial_hold_blocks:
-                        spatial_open = False
-
-                    if rms_ok and not instant_spatial_ok:
-                        if not speech_ok:
-                            stats.speech_rejects += 1
-                        if not doa_ok:
-                            stats.doa_rejects += 1
-                        if not energy_ok:
-                            stats.energy_rejects += 1
-                        if not ratio_ok:
-                            stats.ratio_rejects += 1
-
-                write_chunk = rms_ok and spatial_open
+                if spatial_gating:
+                    write_chunk = rms_ok and spatial_open
+                else:
+                    write_chunk = rms_ok  # continuous: only RMS gate controls writing
 
                 if write_chunk and not opened_this_chunk:
-                    if trigger_on_voice and wf is None:
+                    if trigger_on_voice and wf is None and rms_ok:
                         ensure_wave_open()
-                        if spatial is None:
+                        if spatial is None or not spatial_gating:
                             print("Detected RMS-qualified audio, starting WAV write.")
-                    mono = output_mono_bytes(chunk)
+                    mono = output_mono_bytes(chunk, gain=chunk_spatial_gain)
                     if wf is not None:
                         wf.writeframesraw(mono)
                         stats.saved_chunks += 1
@@ -1847,6 +1444,8 @@ def record(
                         if focus is not None and ratio_threshold > 0.0:
                             parts.append(f" focus={focus:.2f} {'OK' if ratio_ok else 'LOW'}")
                         parts.append(f" spatial={'OPEN' if spatial_open else 'WAIT'}")
+                        if not spatial_gating and chunk_spatial_gain < 0.98:
+                            parts.append(f" soft_gain={chunk_spatial_gain:.2f}")
                     parts.append(f" saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
                     print("".join(parts))
                     last_status_time = now
@@ -1940,16 +1539,28 @@ def parse_args():
         help="Reference speech energy override (bypasses calibration file)",
     )
     p.add_argument(
-        "--energy-tolerance", type=float, default=0.70,
-        help="Allowed energy drop below reference as fraction 0–1 (default: 0.7)",
+        "--energy-tolerance", type=float, default=1.0 - DEFAULT_DISTANCE_RATIO,
+        help=(
+            "Allowed RMS drop below the 0.5 m reference as fraction 0-1 "
+            f"(default: {1.0 - DEFAULT_DISTANCE_RATIO:.2f}, "
+            f"requires >= {DEFAULT_DISTANCE_RATIO * 100:.0f} percent of ref)"
+        ),
     )
     p.add_argument(
         "--ratio-threshold", type=float, default=DEFAULT_RATIO_THRESHOLD,
-        help="Optional focus ratio E0/sum(E0..E3); 0 disables it (default: 0)",
+        help=(
+            "Minimum beam focus ratio E0/sum(E0..E3). "
+            "Used for diagnostics and for hard rejection only with --spatial-gating "
+            f"(default: {DEFAULT_RATIO_THRESHOLD})"
+        ),
     )
     p.add_argument(
-        "--trigger-on-voice", action="store_true", default=True,
-        help="Create the WAV only after the first RMS/DOA/energy-approved voice chunk",
+        "--trigger-on-voice", action="store_true", default=False,
+        help="Only create the WAV after the first voice-accepted chunk is detected",
+    )
+    p.add_argument(
+        "--spatial-gating", action="store_true", default=False,
+        help="Reject chunks whose DOA/energy/ratio fail spatial checks (default: continuous recording)",
     )
     p.add_argument(
         "--no-denoise", action="store_true",
@@ -2040,6 +1651,7 @@ def main() -> int:
                 angle_tolerance_deg=180.0,     # disable DOA gate
                 ref_rms=None,                   # disable RMS distance gate
                 enable_spatial=True,            # collect speech energy samples
+                spatial_gating=False,           # calibration mode: continuous
             )
             if stats.doa_samples:
                 print(f"\n  DOA samples    : {len(stats.doa_samples)}")
@@ -2077,6 +1689,7 @@ def main() -> int:
             distance_ratio=1.0 - args.energy_tolerance,
             ratio_threshold=args.ratio_threshold,
             enable_spatial=not args.no_spatial,
+            spatial_gating=args.spatial_gating,
             trigger_on_voice=args.trigger_on_voice,
             denoise=not args.no_denoise,
             denoise_strength=args.denoise_strength,
@@ -2114,6 +1727,11 @@ def main() -> int:
         print(
             f"  Off-axis  : suppressed {stats.offaxis_suppressed_chunks} chunks "
             f"(ref_peak_rms={stats.offaxis_reference_peak_rms:.4f})"
+        )
+    if stats.spatial_attenuated_chunks > 0:
+        print(
+            f"  Soft DOA  : attenuated {stats.spatial_attenuated_chunks} chunks "
+            f"(min_gain={stats.spatial_min_gain:.2f})"
         )
     if stats.speech_rejects or stats.doa_rejects or stats.energy_rejects or stats.ratio_rejects:
         print(f"  Speech rejects: {stats.speech_rejects} chunks")

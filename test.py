@@ -71,12 +71,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     """Record with spatial filtering enabled."""
     import respeaker_xvf3800_beam_record as r
 
-    ref_energy = args.ref_energy
-    if ref_energy is None and args.distance_gate and not args.no_spatial:
+    ref_rms = args.ref_energy
+    if ref_rms is None and args.distance_gate and not args.no_spatial:
         try:
             cal = r._load_calibration(args.cal_json)
-            ref_energy = cal.get("ref_energy")
-            print(f"Calibration loaded: ref_energy={ref_energy:.6f}")
+            ref_rms = cal.get("ref_rms", cal.get("ref_energy"))
+            print(f"Calibration loaded: ref_rms={ref_rms:.6f}")
         except (FileNotFoundError, KeyError):
             print("No calibration file found – distance gate disabled.")
     elif not args.distance_gate:
@@ -91,8 +91,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         attack_ms=args.attack_ms,
         hold_ms=args.hold_ms,
         angle_tolerance_deg=args.angle_tolerance,
-        ref_energy=ref_energy,
-        energy_tolerance=args.energy_tolerance,
+        ref_rms=ref_rms,
+        distance_ratio=1.0 - args.energy_tolerance,
         ratio_threshold=args.ratio_threshold,
         enable_spatial=not args.no_spatial,
         trigger_on_voice=args.trigger_on_voice,
@@ -172,9 +172,9 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--attack-ms", type=float, default=40.0)
     rec.add_argument("--hold-ms", type=float, default=400.0)
     rec.add_argument("--ref-energy", type=float, default=None,
-                     help="Reference energy override")
-    rec.add_argument("--energy-tolerance", type=float, default=0.5,
-                     help="Allowed energy deviation fraction (default: 0.5)")
+                     help="Reference RMS override")
+    rec.add_argument("--energy-tolerance", type=float, default=0.30,
+                     help="Allowed RMS drop below reference (default: 0.30, requires >=70% of ref)")
     rec.add_argument("--cal-json", default="calibration.json")
     rec.add_argument("--no-spatial", action="store_true",
                      help="Disable spatial filter")

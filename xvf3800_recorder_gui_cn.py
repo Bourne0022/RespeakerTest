@@ -58,13 +58,14 @@ class RecorderApp(tk.Tk):
         self.device_var = tk.StringVar(value="XVF3800")
         self.spatial_var = tk.BooleanVar(value=True)
         self.distance_gate_var = tk.BooleanVar(value=True)
-        self.trigger_var = tk.BooleanVar(value=True)
+        self.trigger_var = tk.BooleanVar(value=False)
+        self.spatial_gating_var = tk.BooleanVar(value=False)
         self.denoise_var = tk.BooleanVar(value=True)
         self.offaxis_var = tk.BooleanVar(value=True)
         self.calibration_var = tk.StringVar(value=str(self._app_dir() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
         self.angle_tolerance_var = tk.StringVar(value="25")
-        self.ratio_threshold_var = tk.StringVar(value="0.0")
+        self.ratio_threshold_var = tk.StringVar(value="0.35")
         self.status_var = tk.StringVar(value="就绪")
 
         self._build_ui()
@@ -110,16 +111,17 @@ class RecorderApp(tk.Tk):
 
         options = ttk.Frame(settings)
         options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        ttk.Checkbutton(options, text="启用角度门控（无需定标）", variable=self.spatial_var).pack(side="left")
+        ttk.Checkbutton(options, text="启用角度门控（无标定）", variable=self.spatial_var).pack(side="left")
         ttk.Checkbutton(options, text="启用距离门控（RMS 标定）", variable=self.distance_gate_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="检测到人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(options, text="空间门控（严格拒绝离轴块）", variable=self.spatial_gating_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="抑制离轴人声", variable=self.offaxis_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="启用轻量降噪", variable=self.denoise_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="录完后播放", variable=self.playback_var).pack(side="left", padx=(18, 0))
 
         ttk.Label(settings, text="角度容差（度）").grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(settings, textvariable=self.angle_tolerance_var, width=10).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(settings, text="波束比阈值（0关闭）").grid(row=5, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(settings, text="波束比阈值（仅空间门控）").grid(row=5, column=2, sticky="w", pady=(8, 0))
         ttk.Entry(settings, textvariable=self.ratio_threshold_var, width=10).grid(row=5, column=3, sticky="w", pady=(8, 0))
 
         ttk.Label(settings, text="标定文件（仅距离门控使用）").grid(row=6, column=0, sticky="w", pady=(8, 0))
@@ -136,7 +138,7 @@ class RecorderApp(tk.Tk):
 
         hint = ttk.Label(
             root,
-            text="提示：当前默认按设备语音检测 + 30° 方向门控录音；距离门控使用标定里的 ref_rms。",
+            text="提示：默认连续录音，使用 30° 固定波束、RMS 0.5m 近似（≥70% 标定值）和离轴软抑制；空间门控开启后才会严格丢弃离轴块。",
             foreground="#444",
         )
         hint.pack(fill="x", pady=(0, 8))
@@ -149,7 +151,7 @@ class RecorderApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self._log("就绪。默认启用 30° 人声/DOA 门控和 RMS 距离门控；波束比阈值默认关闭。\n")
+        self._log("就绪。默认：连续录音 + 30° 固定波束 + RMS 0.5m 近似（≥70% 标定值）+ 离轴软抑制；空间门控默认关闭。\n")
 
     def _browse_output(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -275,9 +277,10 @@ class RecorderApp(tk.Tk):
                     hold_ms=hold,
                     angle_tolerance_deg=angle_tolerance,
                     ref_rms=ref_rms,
-                    distance_ratio=0.30,
+                    distance_ratio=recorder.DEFAULT_DISTANCE_RATIO,
                     ratio_threshold=ratio_threshold,
                     enable_spatial=enable_spatial,
+                    spatial_gating=self.spatial_gating_var.get(),
                     stop_event=self.stop_event,
                     trigger_on_voice=self.trigger_var.get(),
                     denoise=self.denoise_var.get(),
@@ -307,6 +310,11 @@ class RecorderApp(tk.Tk):
                 self.log_queue.put(
                     f"离轴抑制：处理块数={stats.offaxis_suppressed_chunks}，"
                     f"参考峰值 RMS={stats.offaxis_reference_peak_rms:.4f}\n"
+                )
+            if stats.spatial_attenuated_chunks > 0:
+                self.log_queue.put(
+                    f"DOA 软衰减：处理块数={stats.spatial_attenuated_chunks}，"
+                    f"最低增益={stats.spatial_min_gain:.2f}\n"
                 )
             if stats.denoise_applied:
                 self.log_queue.put(

@@ -60,8 +60,8 @@ BLOCKSIZE = 1024
 
 # USB parameter table (resid, cmdid, count, access, type)
 PARAMS = {
-    "AEC_FIXEDBEAMSAZIMUTH_VALUES":  (33, 81, 4, "rw", "radians"),
-    "AEC_FIXEDBEAMSELEVATION_VALUES": (33, 82, 4, "rw", "radians"),
+    "AEC_FIXEDBEAMSAZIMUTH_VALUES":  (33, 81, 2, "rw", "radians"),
+    "AEC_FIXEDBEAMSELEVATION_VALUES": (33, 82, 2, "rw", "radians"),
     "AEC_FIXEDBEAMSONOFF":           (33, 37, 1, "rw", "int32"),
     "AEC_FIXEDBEAMSGATING":          (33, 83, 1, "rw", "uint8"),
     "AUDIO_MGR_OP_L":                (35, 15, 2, "rw", "uint8"),
@@ -213,10 +213,11 @@ def configure(ctrl: XVF3800, beam_deg: float) -> None:
     print(f"  Fixed beam 0 → {beam_deg:.0f}° (target, audio output)")
     print(f"  Fixed beam 1 → {(beam_deg + 180) % 360:.0f}° (opposite)")
 
-    # Write 2 fixed beams (remaining 2 slots unused)
-    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opp_rad, 0.0, 0.0])
-    ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0, 0.0, 0.0])
-    ctrl.write("AEC_FIXEDBEAMSGATING", [0])
+    ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opp_rad])
+    ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0])
+    # Keep fixed-beam gating enabled. On XVF3800 firmware this preserves the
+    # fixed beam output level while the inactive beam is silenced.
+    ctrl.write("AEC_FIXEDBEAMSGATING", [1])
     ctrl.write("AEC_FIXEDBEAMSONOFF", [1])
 
     # Route fixed beam 0 output to left audio channel

@@ -1,7 +1,14 @@
 {
   "target_angle_deg": 30.0,
   "target_distance_m": 0.5,
-  "ref_energy": 0.033836,
-  "ref_rms": 0.033836,
-  "calibrated_at": "2026-05-06T14:52:50.630529"
+  "ref_energy": 0.086293,
+  "ref_rms": 0.086293,
+  "runs": 5,
+  "duration_sec": 5.0,
+  "rms_threshold": 0.03,
+  "attack_ms": 40.0,
+  "hold_ms": 400.0,
+  "device_hint": "XVF3800",
+  "note": "Reference RMS from 30deg / approximately 0.5m calibration; recorder default requires >=70% of this RMS.",
+  "calibrated_at": "2026-05-06T22:35:48.790608"
 }
