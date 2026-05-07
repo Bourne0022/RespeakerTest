@@ -83,6 +83,9 @@ DEFAULT_DENOISE = True
 DEFAULT_DENOISE_STRENGTH = 0.65
 DEFAULT_DENOISE_MIN_GAIN = 0.35
 DEFAULT_RATIO_THRESHOLD = 0.0
+DEFAULT_OFFAXIS_SUPPRESSION = True
+DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.80
+DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.18
 
 # ---------------------------------------------------------------------------
 # XVF3800 USB control parameter table
@@ -841,6 +844,73 @@ def extract_mono_bytes(raw_bytes: bytes, channels: int = CHANNELS) -> bytes:
     return mono.tobytes()
 
 
+def suppress_offaxis_bytes(
+    raw_bytes: bytes,
+    channels: int = CHANNELS,
+    strength: float = DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH,
+    min_gain: float = DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN,
+) -> tuple[bytes, bool, float]:
+    """Return target-channel PCM with opposite/reference speech softened.
+
+    The USB left channel is the target fixed beam. When enabled, the right
+    channel is routed to the opposite fixed beam and used only as a reference.
+    Frequencies that are stronger in the reference beam are attenuated in the
+    target beam; target-dominant frequencies are preserved.
+    """
+
+    if np is None or channels < 2 or strength <= 0.0:
+        return extract_mono_bytes(raw_bytes, channels=channels), False, 0.0
+
+    samples = np.frombuffer(raw_bytes, dtype="<i2")
+    if samples.size < channels * 16:
+        return extract_mono_bytes(raw_bytes, channels=channels), False, 0.0
+
+    frames = samples[: (samples.size // channels) * channels].reshape(-1, channels)
+    target = frames[:, 0].astype(np.float32) / 32768.0
+    reference = frames[:, 1].astype(np.float32) / 32768.0
+
+    target_rms = float(np.sqrt(np.mean(target * target))) if target.size else 0.0
+    ref_rms = float(np.sqrt(np.mean(reference * reference))) if reference.size else 0.0
+    if ref_rms < 0.002 or target_rms <= 0.0:
+        return frames[:, 0].astype("<i2").tobytes(), False, ref_rms
+
+    relative_ref = ref_rms / max(target_rms, 1e-6)
+    if relative_ref < 0.18:
+        return frames[:, 0].astype("<i2").tobytes(), False, ref_rms
+
+    n = target.size
+    target_spec = np.fft.rfft(target)
+    ref_spec = np.fft.rfft(reference)
+    target_mag = np.abs(target_spec)
+    ref_mag = np.abs(ref_spec)
+    freqs = np.fft.rfftfreq(n, d=1.0 / SAMPLE_RATE)
+
+    speech_band = (freqs >= 140.0) & (freqs <= 4200.0)
+    reference_share = ref_mag / (target_mag + ref_mag + 1e-8)
+    dominance = np.clip((reference_share - 0.52) / 0.40, 0.0, 1.0)
+
+    chunk_strength = min(max(strength, 0.0), 1.0)
+    if relative_ref < 0.75:
+        chunk_strength *= 0.55
+    elif relative_ref > 1.25:
+        chunk_strength = min(1.0, chunk_strength * 1.15)
+
+    gain = np.ones_like(target_mag, dtype=np.float32)
+    speech_gain = 1.0 - chunk_strength * dominance[speech_band]
+    speech_floor = min(max(min_gain, 0.05), 0.80)
+    gain[speech_band] = np.maximum(speech_gain, speech_floor)
+
+    cleaned = np.fft.irfft(target_spec * gain, n=n).astype(np.float32)
+    peak_in = float(np.max(np.abs(target))) if target.size else 0.0
+    peak_out = float(np.max(np.abs(cleaned))) if cleaned.size else 0.0
+    if peak_in > 0.0 and peak_out > peak_in:
+        cleaned *= peak_in / peak_out
+
+    pcm = np.clip(cleaned * 32767.0, -32768, 32767).astype("<i2")
+    suppressed = bool(np.any((dominance[speech_band] > 0.15) & (gain[speech_band] < 0.92)))
+    return pcm.tobytes(), suppressed, ref_rms
+
+
 @dataclass
 class DenoiseResult:
     applied: bool = False
@@ -1014,6 +1084,8 @@ class RecordStats:
     denoise_applied: bool = False
     denoise_noise_rms: float = 0.0
     denoise_peak_rms: float = 0.0
+    offaxis_suppressed_chunks: int = 0
+    offaxis_reference_peak_rms: float = 0.0
     doa_samples: list[float] = None  # type: ignore[assignment]
     energy_samples: list[float] = None  # type: ignore[assignment]
 
@@ -1136,22 +1208,26 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
 # Official 2-beam fixed-beam configuration
 # ======================================================================
 
-def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
-    """Configure the official two fixed beams and route target beam to USB L."""
+def configure_device(
+    ctrl: ReSpeakerControl,
+    beam_deg: float,
+    reference_beam: bool = False,
+) -> None:
+    """Configure two fixed beams and optionally route the opposite beam to USB R."""
 
     beam_rad = _radians(beam_deg)
     opposite_rad = _radians((beam_deg + 180.0) % 360.0)
 
     print(f"Configuring fixed beam: azimuth={beam_deg:.1f}°, elevation=0°")
     print(f"  Beam 0 -> {beam_deg:.1f}° (target, audio out)")
-    print(f"  Beam 1 -> {(beam_deg + 180.0) % 360.0:.1f}° (opposite)")
+    print(f"  Beam 1 -> {(beam_deg + 180.0) % 360.0:.1f}° (opposite/reference)")
 
     ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad])
     ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0])
-    ctrl.write("AEC_FIXEDBEAMSGATING", [1])
+    ctrl.write("AEC_FIXEDBEAMSGATING", [0 if reference_beam else 1])
     ctrl.write("AEC_FIXEDBEAMSONOFF", [1])
     ctrl.write("AUDIO_MGR_OP_L", [6, 0])
-    ctrl.write("AUDIO_MGR_OP_R", [0, 0])
+    ctrl.write("AUDIO_MGR_OP_R", [6, 1] if reference_beam else [0, 0])
 
     try:
         azimuths = ctrl.read("AEC_FIXEDBEAMSAZIMUTH_VALUES", retry=True, max_retries=10)
@@ -1173,6 +1249,10 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
         op_l = ctrl.read("AUDIO_MGR_OP_L", retry=True, max_retries=10)
     except RuntimeError:
         op_l = None
+    try:
+        op_r = ctrl.read("AUDIO_MGR_OP_R", retry=True, max_retries=10)
+    except RuntimeError:
+        op_r = None
 
     az_ok = True
     if azimuths is not None and len(azimuths) >= 2:
@@ -1181,8 +1261,11 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
     if elevations is not None and len(elevations) >= 2:
         el_ok = all(abs(e) < 0.1 for e in elevations[:2])
     en_ok = (enabled == (1,)) if enabled is not None else True
-    gating_ok = (gating == (1,)) if gating is not None else True
+    expected_gating = (0,) if reference_beam else (1,)
+    expected_op_r = (6, 1) if reference_beam else (0, 0)
+    gating_ok = (gating == expected_gating) if gating is not None else True
     route_ok = (op_l == (6, 0)) if op_l is not None else True
+    route_ok = route_ok and ((op_r == expected_op_r) if op_r is not None else True)
 
     if not az_ok:
         print(f"  WARNING: azimuth mismatch - wrote {[beam_rad, opposite_rad]}, read {azimuths}", file=sys.stderr)
@@ -1193,10 +1276,16 @@ def configure_device(ctrl: ReSpeakerControl, beam_deg: float) -> None:
     if not gating_ok:
         print(f"  WARNING: fixed-beam gating may be OFF (read AEC_FIXEDBEAMSGATING={gating})", file=sys.stderr)
     if not route_ok:
-        print(f"  WARNING: audio routing mismatch - wrote [6, 0], read {op_l}", file=sys.stderr)
+        print(
+            f"  WARNING: audio routing mismatch - wrote L=[6, 0], R={list(expected_op_r)}, "
+            f"read L={op_l}, R={op_r}",
+            file=sys.stderr,
+        )
 
     if az_ok and el_ok and en_ok and gating_ok and route_ok:
         print("  Beam configuration verified OK.")
+    if reference_beam:
+        print("  USB right channel carries opposite-beam reference for off-axis suppression.")
 
     try:
         doa = ctrl.read("DOA_VALUE", retry=True, max_retries=5)
@@ -1514,6 +1603,8 @@ def record(
     trigger_on_voice: bool = True,
     denoise: bool = DEFAULT_DENOISE,
     denoise_strength: float = DEFAULT_DENOISE_STRENGTH,
+    offaxis_suppression: bool = DEFAULT_OFFAXIS_SUPPRESSION,
+    offaxis_suppression_strength: float = DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH,
 ) -> RecordStats:
     """Record chunks that pass device VAD, DOA and optional distance checks."""
 
@@ -1528,7 +1619,7 @@ def record(
     spatial: Optional[SpatialMonitor] = None
     wf: Optional[wave.Wave_write] = None
     try:
-        configure_device(ctrl, beam_deg)
+        configure_device(ctrl, beam_deg, reference_beam=offaxis_suppression)
 
         input_index = pick_input_device(device_hint)
         if input_index is None:
@@ -1570,6 +1661,11 @@ def record(
                 f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
                 f"distance RMS {dist_msg} | focus {ratio_msg}"
             )
+        if offaxis_suppression:
+            print(
+                f"Off-axis suppression: enabled "
+                f"(opposite beam reference, strength={offaxis_suppression_strength:.2f})"
+            )
 
         block_seconds = BLOCKSIZE / SAMPLE_RATE
         spatial_attack_blocks = max(
@@ -1597,6 +1693,19 @@ def record(
         stats = RecordStats()
         t_start = time.monotonic()
         last_status_time = t_start
+
+        def output_mono_bytes(stereo_chunk: bytes) -> bytes:
+            if not offaxis_suppression:
+                return extract_mono_bytes(stereo_chunk, channels=CHANNELS)
+            mono, suppressed, ref_rms = suppress_offaxis_bytes(
+                stereo_chunk,
+                channels=CHANNELS,
+                strength=offaxis_suppression_strength,
+            )
+            stats.offaxis_reference_peak_rms = max(stats.offaxis_reference_peak_rms, ref_rms)
+            if suppressed:
+                stats.offaxis_suppressed_chunks += 1
+            return mono
 
         def callback(indata, frames, _time_info, status) -> None:
             if status:
@@ -1693,7 +1802,7 @@ def record(
                         if wf is not None:
                             while pre_roll_chunks:
                                 buffered = pre_roll_chunks.popleft()
-                                wf.writeframesraw(extract_mono_bytes(buffered, channels=CHANNELS))
+                                wf.writeframesraw(output_mono_bytes(buffered))
                                 stats.saved_chunks += 1
                                 stats.saved_frames += len(buffered) // (SAMPLE_WIDTH_BYTES * CHANNELS)
 
@@ -1717,7 +1826,7 @@ def record(
                         ensure_wave_open()
                         if spatial is None:
                             print("Detected RMS-qualified audio, starting WAV write.")
-                    mono = extract_mono_bytes(chunk, channels=CHANNELS)
+                    mono = output_mono_bytes(chunk)
                     if wf is not None:
                         wf.writeframesraw(mono)
                         stats.saved_chunks += 1
@@ -1849,6 +1958,17 @@ def parse_args():
         help=f"Light denoise strength 0-1 (default: {DEFAULT_DENOISE_STRENGTH})",
     )
     p.add_argument(
+        "--no-offaxis-suppression", action="store_true",
+        help="Disable opposite-beam sidechain suppression for off-axis speech",
+    )
+    p.add_argument(
+        "--offaxis-strength", type=float, default=DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH,
+        help=(
+            "Opposite-beam suppression strength 0-1 "
+            f"(default: {DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH})"
+        ),
+    )
+    p.add_argument(
         "--target-distance", type=float, default=0.5,
         help="Target distance in meters for calibration record (default: 0.5)",
     )
@@ -1875,6 +1995,9 @@ def main() -> int:
         return 1
     if not 0.0 <= args.denoise_strength <= 1.0:
         print("ERROR: --denoise-strength must be between 0.0 and 1.0", file=sys.stderr)
+        return 1
+    if not 0.0 <= args.offaxis_strength <= 1.0:
+        print("ERROR: --offaxis-strength must be between 0.0 and 1.0", file=sys.stderr)
         return 1
 
     print("=" * 58)
@@ -1955,6 +2078,8 @@ def main() -> int:
             trigger_on_voice=args.trigger_on_voice,
             denoise=not args.no_denoise,
             denoise_strength=args.denoise_strength,
+            offaxis_suppression=not args.no_offaxis_suppression,
+            offaxis_suppression_strength=args.offaxis_strength,
         )
     except RuntimeError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
@@ -1983,6 +2108,11 @@ def main() -> int:
         )
     elif not args.no_denoise and saved_sec > 0.0:
         print("  Denoise   : skipped")
+    if stats.offaxis_reference_peak_rms > 0.0:
+        print(
+            f"  Off-axis  : suppressed {stats.offaxis_suppressed_chunks} chunks "
+            f"(ref_peak_rms={stats.offaxis_reference_peak_rms:.4f})"
+        )
     if stats.speech_rejects or stats.doa_rejects or stats.energy_rejects or stats.ratio_rejects:
         print(f"  Speech rejects: {stats.speech_rejects} chunks")
         print(f"  DOA rejects   : {stats.doa_rejects} chunks")
