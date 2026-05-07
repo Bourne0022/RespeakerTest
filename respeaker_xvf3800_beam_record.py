@@ -87,9 +87,9 @@ DEFAULT_REFERENCE_RMS = 0.086293
 DEFAULT_DISTANCE_RATIO = 0.70
 DEFAULT_DISTANCE_MIN_RMS = DEFAULT_REFERENCE_RMS * DEFAULT_DISTANCE_RATIO
 DEFAULT_OFFAXIS_SUPPRESSION = True
-DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.85
-DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.08
-DEFAULT_SOFT_SPATIAL_MIN_GAIN = 0.18
+DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.95
+DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.05
+DEFAULT_SOFT_SPATIAL_MIN_GAIN = 0.10
 
 # ---------------------------------------------------------------------------
 # XVF3800 USB control parameter table
@@ -745,15 +745,65 @@ def soft_spatial_gain(
     gain = 1.0 - offaxis * (1.0 - DEFAULT_SOFT_SPATIAL_MIN_GAIN)
 
     if diff >= 90.0:
-        gain = min(gain, 0.24)
+        gain = min(gain, 0.14)
     if (
         focus is not None
         and ratio_threshold > 0.0
         and focus < max(0.05, ratio_threshold * 0.60)
     ):
-        gain = min(gain, 0.35)
+        gain = min(gain, 0.22)
 
     return max(DEFAULT_SOFT_SPATIAL_MIN_GAIN, gain)
+
+
+def best_reference_alignment(
+    target: "np.ndarray",
+    reference: "np.ndarray",
+    max_lag: int = 24,
+) -> tuple["np.ndarray", float, float]:
+    """Return the reference aligned to target plus scale and correlation."""
+
+    best_ref = reference
+    best_coeff = 0.0
+    best_corr = 0.0
+
+    target_energy = float(np.dot(target, target))
+    if target_energy <= 1e-9:
+        return best_ref, best_coeff, best_corr
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            ref_part = reference[-lag:]
+            tgt_part = target[: ref_part.size]
+        elif lag > 0:
+            ref_part = reference[:-lag]
+            tgt_part = target[lag:]
+        else:
+            ref_part = reference
+            tgt_part = target
+
+        if ref_part.size < 32:
+            continue
+
+        ref_energy = float(np.dot(ref_part, ref_part))
+        if ref_energy <= 1e-9:
+            continue
+
+        cross = float(np.dot(tgt_part, ref_part))
+        corr = abs(cross) / math.sqrt(max(1e-12, float(np.dot(tgt_part, tgt_part)) * ref_energy))
+        if corr > best_corr:
+            aligned = np.zeros_like(reference)
+            if lag < 0:
+                aligned[: ref_part.size] = ref_part
+            elif lag > 0:
+                aligned[lag : lag + ref_part.size] = ref_part
+            else:
+                aligned = reference
+            best_ref = aligned
+            best_coeff = cross / ref_energy
+            best_corr = corr
+
+    return best_ref, best_coeff, best_corr
 
 
 def suppress_offaxis_bytes(
@@ -795,8 +845,22 @@ def suppress_offaxis_bytes(
     if relative_ref < 0.15:
         return frames[:, 0].astype("<i2").tobytes(), False, ref_rms
 
+    working = target.copy()
+    aligned_ref, cancel_coeff, cancel_corr = best_reference_alignment(target, reference)
+    if cancel_corr >= 0.08:
+        if relative_ref < 0.45:
+            cancel_strength = 0.20
+        elif relative_ref < 0.80:
+            cancel_strength = 0.45
+        elif relative_ref < 1.25:
+            cancel_strength = 0.70
+        else:
+            cancel_strength = 0.90
+        cancel_coeff = max(-1.25, min(1.25, cancel_coeff))
+        working = target - (cancel_coeff * cancel_strength * aligned_ref)
+
     n = target.size
-    target_spec = np.fft.rfft(target)
+    target_spec = np.fft.rfft(working)
     ref_spec = np.fft.rfft(reference)
     target_mag = np.abs(target_spec)
     ref_mag = np.abs(ref_spec)
@@ -819,24 +883,24 @@ def suppress_offaxis_bytes(
     # Side voice:    relative_ref ≈ 0.6-1.0  →  moderate suppression
     # Rear voice:    relative_ref ≈ 1.0-3.0  →  heavy suppression
     base_strength = min(max(strength, 0.0), 1.0)
-    if relative_ref < 0.50:
+    if relative_ref < 0.45:
         strength_scale = 0.25
-    elif relative_ref < 0.75:
-        strength_scale = 0.55
+    elif relative_ref < 0.70:
+        strength_scale = 0.65
     elif relative_ref < 1.10:
-        strength_scale = 0.85
+        strength_scale = 0.95
     elif relative_ref < 1.60:
-        strength_scale = 1.00
+        strength_scale = 1.10
     else:
-        strength_scale = 1.15
+        strength_scale = 1.25
     effective_strength = min(1.0, base_strength * strength_scale)
 
     # Build spectral gain with per-band floors.
     # Lower floor = more aggressive suppression for that band.
     speech_gain = 1.0 - effective_strength * dominance
-    low_floor = max(min_gain * 0.7, 0.04)
-    mid_floor = max(min_gain, 0.06)
-    high_floor = max(min_gain * 1.6, 0.12)
+    low_floor = max(min_gain * 0.55, 0.025)
+    mid_floor = max(min_gain, 0.045)
+    high_floor = max(min_gain * 1.5, 0.085)
 
     gain = np.ones_like(target_mag, dtype=np.float32)
     gain[low_band] = np.maximum(speech_gain[low_band], low_floor)
@@ -850,7 +914,10 @@ def suppress_offaxis_bytes(
         cleaned *= peak_in / peak_out
 
     pcm = np.clip(cleaned * 32767.0, -32768, 32767).astype("<i2")
-    suppressed = bool(np.any((dominance > 0.10) & (speech_gain < 0.90)))
+    suppressed = bool(
+        cancel_corr >= 0.08
+        or np.any((dominance > 0.10) & (speech_gain < 0.90))
+    )
     return pcm.tobytes(), suppressed, ref_rms
 
 
