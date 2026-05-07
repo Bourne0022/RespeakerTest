@@ -63,7 +63,7 @@ class RecorderApp(tk.Tk):
         self.calibration_var = tk.StringVar(value=str(self._app_dir() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
         self.angle_tolerance_var = tk.StringVar(value="25")
-        self.ratio_threshold_var = tk.StringVar(value="0.30")
+        self.ratio_threshold_var = tk.StringVar(value="0.0")
         self.status_var = tk.StringVar(value="就绪")
 
         self._build_ui()
@@ -117,7 +117,7 @@ class RecorderApp(tk.Tk):
 
         ttk.Label(settings, text="角度容差（度）").grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(settings, textvariable=self.angle_tolerance_var, width=10).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        ttk.Label(settings, text="波束比阈值").grid(row=5, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(settings, text="波束比阈值（0关闭）").grid(row=5, column=2, sticky="w", pady=(8, 0))
         ttk.Entry(settings, textvariable=self.ratio_threshold_var, width=10).grid(row=5, column=3, sticky="w", pady=(8, 0))
 
         ttk.Label(settings, text="标定文件（仅距离门控使用）").grid(row=6, column=0, sticky="w", pady=(8, 0))
@@ -147,7 +147,7 @@ class RecorderApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self._log("就绪。当前默认是无定标模式，只做 30° 方向门控和人声触发。\n")
+        self._log("就绪。默认启用 30° 人声/DOA 门控和 RMS 距离门控；波束比阈值默认关闭。\n")
 
     def _browse_output(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -298,7 +298,7 @@ class RecorderApp(tk.Tk):
                 )
             if stats.doa_rejects or stats.energy_rejects:
                 self.log_queue.put(f"DOA 拒绝块数：{stats.doa_rejects}\n")
-                self.log_queue.put(f"能量拒绝块数：{stats.energy_rejects}\n")
+                self.log_queue.put(f"距离/RMS 拒绝块数：{stats.energy_rejects}\n")
                 self.log_queue.put(f"波束比拒绝块数：{stats.ratio_rejects}\n")
             if stats.denoise_applied:
                 self.log_queue.put(

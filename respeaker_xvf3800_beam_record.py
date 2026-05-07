@@ -82,6 +82,7 @@ DEFAULT_HOLD_MS = 400.0
 DEFAULT_DENOISE = True
 DEFAULT_DENOISE_STRENGTH = 0.65
 DEFAULT_DENOISE_MIN_GAIN = 0.35
+DEFAULT_RATIO_THRESHOLD = 0.0
 
 # ---------------------------------------------------------------------------
 # XVF3800 USB control parameter table
@@ -264,7 +265,7 @@ class SpatialMonitor:
         angle_tolerance_deg: float,
         ref_energy: Optional[float],
         energy_tolerance: float,
-        ratio_threshold: float = 0.30,
+        ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
     ) -> None:
         self._ctrl = ctrl
         self.target_angle = target_angle_deg
@@ -399,7 +400,7 @@ class SpatialMonitor:
         angle_tolerance_deg: float,
         ref_rms: Optional[float],
         distance_ratio: float,
-        ratio_threshold: float = 0.30,
+        ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
     ) -> None:
         self._ctrl = ctrl
         self.target_angle = target_angle_deg
@@ -1221,7 +1222,7 @@ def record(
     angle_tolerance_deg: float = 25.0,
     ref_rms: Optional[float] = None,
     distance_ratio: float = 0.30,
-    ratio_threshold: float = 0.30,
+    ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
     trigger_on_voice: bool = False,
@@ -1507,7 +1508,7 @@ def record(
     ref_rms: Optional[float] = None,
     ref_energy: Optional[float] = None,
     distance_ratio: float = 0.30,
-    ratio_threshold: float = 0.30,
+    ratio_threshold: float = DEFAULT_RATIO_THRESHOLD,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
     trigger_on_voice: bool = True,
@@ -1732,7 +1733,7 @@ def record(
                     if spatial is not None:
                         parts.append(f" speech={'YES' if speech_ok else 'no'}")
                         parts.append(f" DOA={doa_deg:.1f}deg {'OK' if doa_ok else 'OFF'}" if doa_deg is not None else " DOA=--")
-                        if focus is not None:
+                        if focus is not None and ratio_threshold > 0.0:
                             parts.append(f" focus={focus:.2f} {'OK' if ratio_ok else 'LOW'}")
                         parts.append(f" spatial={'OPEN' if spatial_open else 'WAIT'}")
                     parts.append(f" saved={stats.saved_frames / SAMPLE_RATE:.1f}s")
@@ -1832,8 +1833,8 @@ def parse_args():
         help="Allowed energy drop below reference as fraction 0–1 (default: 0.7)",
     )
     p.add_argument(
-        "--ratio-threshold", type=float, default=0.30,
-        help="Optional focus ratio E0/sum(E0..E3); 0 disables it (default: 0.30)",
+        "--ratio-threshold", type=float, default=DEFAULT_RATIO_THRESHOLD,
+        help="Optional focus ratio E0/sum(E0..E3); 0 disables it (default: 0)",
     )
     p.add_argument(
         "--trigger-on-voice", action="store_true", default=True,
