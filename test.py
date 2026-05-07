@@ -78,7 +78,11 @@ def cmd_record(args: argparse.Namespace) -> int:
             ref_rms = cal.get("ref_rms", cal.get("ref_energy"))
             print(f"Calibration loaded: ref_rms={ref_rms:.6f}")
         except (FileNotFoundError, KeyError):
-            print("No calibration file found – distance gate disabled.")
+            ref_rms = r.DEFAULT_REFERENCE_RMS
+            print(
+                f"No calibration file found; using built-in 0.5m ref_rms={ref_rms:.6f} "
+                f"(min_rms={r.DEFAULT_DISTANCE_MIN_RMS:.4f})."
+            )
     elif not args.distance_gate:
         print("Distance gate disabled; using angle gate only.")
 

@@ -9,6 +9,8 @@
   "attack_ms": 40.0,
   "hold_ms": 400.0,
   "device_hint": "XVF3800",
-  "note": "Reference RMS from 30deg / approximately 0.5m calibration; recorder default requires >=70% of this RMS.",
+  "distance_ratio": 0.7,
+  "min_accept_rms": 0.060405,
+  "note": "Reference RMS from 30deg / approximately 0.5m calibration; recorder default requires >=70% of this RMS, i.e. min_accept_rms=0.060405.",
   "calibrated_at": "2026-05-06T22:35:48.790608"
 }

@@ -21,7 +21,6 @@ except ImportError:  # pragma: no cover
 
 
 APP_TITLE = "XVF3800 波束录音工具"
-DEFAULT_REF_RMS = 0.086293
 
 
 class TextQueueWriter(io.TextIOBase):
@@ -250,17 +249,17 @@ class RecorderApp(tk.Tk):
                     cal = recorder._load_calibration(str(cal_path))
                     ref_rms = cal.get("ref_rms", cal.get("ref_energy"))
                     if ref_rms is None or float(ref_rms) <= 0:
-                        ref_rms = DEFAULT_REF_RMS
+                        ref_rms = recorder.DEFAULT_REFERENCE_RMS
                         self.log_queue.put(
-                            f"标定文件无有效 ref_rms，改用默认参考值 {DEFAULT_REF_RMS:.6f}\n"
+                            f"标定文件无有效 ref_rms，改用内置 0.5m 参考值 {recorder.DEFAULT_REFERENCE_RMS:.6f}\n"
                         )
                     else:
                         ref_rms = float(ref_rms)
                         self.log_queue.put(f"已加载标定文件：{cal_path}\n")
                 else:
-                    ref_rms = DEFAULT_REF_RMS
+                    ref_rms = recorder.DEFAULT_REFERENCE_RMS
                     self.log_queue.put(
-                        f"未找到标定文件：使用默认参考值 {DEFAULT_REF_RMS:.6f}。\n"
+                        f"未找到标定文件：使用内置 0.5m 参考值 {recorder.DEFAULT_REFERENCE_RMS:.6f}。\n"
                     )
             elif enable_spatial and not enable_distance:
                 self.log_queue.put("未启用距离门控：仅使用 30° 角度门控 + 人声触发。\n")

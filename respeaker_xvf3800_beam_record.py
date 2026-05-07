@@ -83,7 +83,9 @@ DEFAULT_DENOISE = True
 DEFAULT_DENOISE_STRENGTH = 0.65
 DEFAULT_DENOISE_MIN_GAIN = 0.35
 DEFAULT_RATIO_THRESHOLD = 0.35
+DEFAULT_REFERENCE_RMS = 0.086293
 DEFAULT_DISTANCE_RATIO = 0.70
+DEFAULT_DISTANCE_MIN_RMS = DEFAULT_REFERENCE_RMS * DEFAULT_DISTANCE_RATIO
 DEFAULT_OFFAXIS_SUPPRESSION = True
 DEFAULT_OFFAXIS_SUPPRESSION_STRENGTH = 0.85
 DEFAULT_OFFAXIS_SUPPRESSION_MIN_GAIN = 0.08
@@ -1221,7 +1223,11 @@ def record(
                 ratio_threshold=ratio_threshold,
             )
             spatial.start(interval=0.20)
-            dist_msg = "disabled" if distance_ref is None else f">= {distance_ratio * 100:.0f}% of ref"
+            if distance_ref is None:
+                dist_msg = "disabled"
+            else:
+                min_rms = distance_ref * max(0.0, distance_ratio)
+                dist_msg = f">= {distance_ratio * 100:.0f}% of ref (min_rms={min_rms:.4f})"
             ratio_msg = "disabled" if ratio_threshold <= 0.0 else f">= {ratio_threshold:.2f}"
             print(
                 f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
@@ -1638,7 +1644,12 @@ def main() -> int:
                 print(f"  Target dist  : {cal.get('target_distance_m', '?')} m")
                 print(f"  Ref RMS      : {ref_rms:.6f}")
         except (FileNotFoundError, KeyError, ValueError):
-            pass  # no calibration file – RMS gate will be disabled
+            ref_rms = DEFAULT_REFERENCE_RMS
+            print(
+                f"No valid calibration found; using built-in 0.5 m reference RMS "
+                f"{DEFAULT_REFERENCE_RMS:.6f} "
+                f"(min_rms={DEFAULT_DISTANCE_MIN_RMS:.4f})."
+            )
 
     try:
         # -- calibration mode -----------------------------------------------
