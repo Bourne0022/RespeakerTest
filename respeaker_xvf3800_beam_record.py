@@ -380,9 +380,8 @@ class SpatialMonitor:
 class SpatialMonitor:
     """Monitor official voice/DOA values and beam-energy focus.
 
-    The recorder loop uses the instantaneous verdicts together with its own
-    attack/hold hysteresis. That keeps the target speech from getting chopped
-    while still rejecting sustained off-axis talkers.
+    The distance gate is based on calibrated RMS, not raw USB energy, so the
+    runtime comparison stays in the same scale as the calibration reference.
     """
 
     def __init__(
@@ -390,15 +389,15 @@ class SpatialMonitor:
         ctrl: ReSpeakerControl,
         target_angle_deg: float,
         angle_tolerance_deg: float,
-        ref_energy: Optional[float],
-        energy_tolerance: float,
+        ref_rms: Optional[float],
+        distance_ratio: float,
         ratio_threshold: float = 0.30,
     ) -> None:
         self._ctrl = ctrl
         self.target_angle = target_angle_deg
         self.angle_tolerance = angle_tolerance_deg
-        self.ref_energy = ref_energy
-        self.energy_tolerance = energy_tolerance
+        self.ref_rms = ref_rms
+        self.distance_ratio = distance_ratio
         self.ratio_threshold = ratio_threshold
 
         self._lock = threading.Lock()
@@ -462,7 +461,7 @@ class SpatialMonitor:
 
             time.sleep(interval)
 
-    def check(self):
+    def check(self, rms_level: Optional[float] = None):
         """Return speech/angle/energy/focus verdicts for the latest readings."""
         with self._lock:
             doa_deg = self._latest_doa_deg
@@ -485,11 +484,11 @@ class SpatialMonitor:
                 diff = 360.0 - diff
             doa_ok = diff <= self.angle_tolerance
 
-        if e0 is not None:
-            energy = e0
-            if self.ref_energy is not None and self.ref_energy > 0.0:
-                min_energy = self.ref_energy * max(0.0, 1.0 - self.energy_tolerance)
-                energy_ok = e0 >= min_energy
+        if rms_level is not None:
+            energy = rms_level
+            if self.ref_rms is not None and self.ref_rms > 0.0:
+                min_energy = self.ref_rms * max(0.0, self.distance_ratio)
+                energy_ok = rms_level >= min_energy
 
             if (
                 e1 is not None
@@ -1103,8 +1102,8 @@ def record(
     attack_ms: float = DEFAULT_ATTACK_MS,
     hold_ms: float = DEFAULT_HOLD_MS,
     angle_tolerance_deg: float = 25.0,
-    ref_energy: Optional[float] = None,
-    energy_tolerance: float = 0.5,
+    ref_rms: Optional[float] = None,
+    distance_ratio: float = 0.30,
     ratio_threshold: float = 0.30,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
@@ -1130,11 +1129,11 @@ def record(
         Gate hold time in ms.
     angle_tolerance_deg : float
         Allowed DOA deviation from *beam_deg* before a chunk is rejected.
-    ref_energy : float or None
-        Reference speech energy from calibration.  ``None`` disables the
-        energy/distance gate.
-    energy_tolerance : float
-        Allowed fractional drop below *ref_energy* (0.0 – 1.0).
+    ref_rms : float or None
+        Reference RMS from calibration at the target distance.  ``None``
+        disables the distance gate.
+    distance_ratio : float
+        Minimum fraction of *ref_rms* required to pass the distance gate.
     enable_spatial : bool
         When False the spatial monitor is not started (plain RMS-only gate).
     stop_event : threading.Event or None
@@ -1204,18 +1203,18 @@ def record(
                 ctrl=ctrl,
                 target_angle_deg=beam_deg,
                 angle_tolerance_deg=angle_tolerance_deg,
-                ref_energy=ref_energy,
-                energy_tolerance=energy_tolerance,
+                ref_rms=ref_rms,
+                distance_ratio=distance_ratio,
                 ratio_threshold=ratio_threshold,
             )
             spatial.start(interval=0.25)
-            if ref_energy is not None:
+            if ref_rms is not None:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"energy >= {(1.0 - energy_tolerance) * 100:.0f}% of ref "
-                      f"(ref={ref_energy:.1f})  |  focus >= {ratio_threshold:.2f}")
+                      f"RMS >= {distance_ratio * 100:.0f}% of ref "
+                      f"(ref={ref_rms:.4f})  |  focus >= {ratio_threshold:.2f}")
             else:
                 print(f"Spatial gate : DOA ±{angle_tolerance_deg:.0f}°  |  "
-                      f"energy gate DISABLED  |  focus >= {ratio_threshold:.2f}")
+                      f"RMS gate DISABLED  |  focus >= {ratio_threshold:.2f}")
 
         # ---- 5. keyboard listener (daemon thread) -------------------------
         if stop_event is None:
@@ -1388,8 +1387,9 @@ def record(
     attack_ms: float = DEFAULT_ATTACK_MS,
     hold_ms: float = DEFAULT_HOLD_MS,
     angle_tolerance_deg: float = 25.0,
+    ref_rms: Optional[float] = None,
     ref_energy: Optional[float] = None,
-    energy_tolerance: float = 0.5,
+    distance_ratio: float = 0.30,
     ratio_threshold: float = 0.30,
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
@@ -1432,21 +1432,23 @@ def record(
             hold_ms=hold_ms,
         )
 
+        distance_ref = ref_rms if ref_rms is not None else ref_energy
+
         if enable_spatial:
             spatial = SpatialMonitor(
                 ctrl=ctrl,
                 target_angle_deg=beam_deg,
                 angle_tolerance_deg=angle_tolerance_deg,
-                ref_energy=ref_energy,
-                energy_tolerance=energy_tolerance,
+                ref_rms=distance_ref,
+                distance_ratio=distance_ratio,
                 ratio_threshold=ratio_threshold,
             )
             spatial.start(interval=0.20)
-            dist_msg = "disabled" if ref_energy is None else f">= {(1.0 - energy_tolerance) * 100:.0f}% of ref"
+            dist_msg = "disabled" if distance_ref is None else f">= {distance_ratio * 100:.0f}% of ref"
             ratio_msg = "disabled" if ratio_threshold <= 0.0 else f">= {ratio_threshold:.2f}"
             print(
                 f"Voice filter : device VAD + DOA +/-{angle_tolerance_deg:.0f} deg | "
-                f"distance energy {dist_msg} | focus {ratio_msg}"
+                f"distance RMS {dist_msg} | focus {ratio_msg}"
             )
 
         block_seconds = BLOCKSIZE / SAMPLE_RATE
@@ -1546,7 +1548,7 @@ def record(
                 opened_this_chunk = False
 
                 if spatial is not None:
-                    speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, focus = spatial.check()
+                    speech_ok, doa_ok, energy_ok, ratio_ok, doa_deg, energy, focus = spatial.check(gate.smoothed_rms)
                     if speech_ok:
                         stats.speech_samples += 1
                     if doa_deg is not None:
@@ -1696,8 +1698,8 @@ def parse_args():
         help="Reference speech energy override (bypasses calibration file)",
     )
     p.add_argument(
-        "--energy-tolerance", type=float, default=0.5,
-        help="Allowed energy drop below reference as fraction 0–1 (default: 0.5)",
+        "--energy-tolerance", type=float, default=0.70,
+        help="Allowed energy drop below reference as fraction 0–1 (default: 0.7)",
     )
     p.add_argument(
         "--ratio-threshold", type=float, default=0.30,
@@ -1737,30 +1739,28 @@ def main() -> int:
     print("  ReSpeaker XVF3800 – Beamforming Audio Recorder")
     print("=" * 58)
 
-    # -- resolve reference energy -------------------------------------------
-    ref_energy: Optional[float] = args.ref_energy
+    # -- resolve reference RMS ----------------------------------------------
+    ref_rms: Optional[float] = args.ref_energy
 
-    if ref_energy is None and not args.calibrate and not args.no_spatial:
-        # Try loading from calibration JSON
-        import json as _json
+    if ref_rms is None and not args.calibrate and not args.no_spatial:
         try:
             cal = _load_calibration(args.cal_json)
-            ref_energy = cal.get("ref_energy")
-            if ref_energy is not None:
+            ref_rms = cal.get("ref_rms", cal.get("ref_energy"))
+            if ref_rms is not None:
                 print(f"Loaded calibration: {args.cal_json}")
                 print(f"  Target angle : {cal.get('target_angle_deg', '?')}°")
                 print(f"  Target dist  : {cal.get('target_distance_m', '?')} m")
-                print(f"  Ref energy   : {ref_energy:.6f}")
+                print(f"  Ref RMS      : {ref_rms:.6f}")
         except (FileNotFoundError, KeyError, ValueError):
-            pass  # no calibration file – energy gate will be disabled
+            pass  # no calibration file – RMS gate will be disabled
 
     try:
         # -- calibration mode -----------------------------------------------
         if args.calibrate:
-            # Enable spatial so we can collect AEC_SPENERGY_VALUES readings.
+            # Enable spatial so we can collect RMS samples at the target position.
             # DOA and energy gates are effectively disabled (wide tolerance,
-            # no ref_energy) so all RMS-gated audio passes through while the
-            # background thread samples the device's speech energy.
+            # no ref_rms) so all RMS-gated audio passes through while the
+            # background thread samples the reference level.
             import statistics
             stats = record(
                 output_path=args.output,
@@ -1771,25 +1771,25 @@ def main() -> int:
                 attack_ms=args.attack_ms,
                 hold_ms=args.hold_ms,
                 angle_tolerance_deg=180.0,     # disable DOA gate
-                ref_energy=None,                # disable energy gate
+                ref_rms=None,                   # disable RMS distance gate
                 enable_spatial=True,            # collect speech energy samples
             )
             if stats.doa_samples:
                 print(f"\n  DOA samples    : {len(stats.doa_samples)}")
                 print(f"  DOA mean       : {statistics.mean(stats.doa_samples):.1f}°")
             if stats.energy_samples:
-                avg_energy = statistics.mean(stats.energy_samples)
-                print(f"  Energy samples : {len(stats.energy_samples)}")
-                print(f"  Energy mean    : {avg_energy:.1f}")
+                avg_rms = statistics.mean(stats.energy_samples)
+                print(f"  RMS samples    : {len(stats.energy_samples)}")
+                print(f"  RMS mean       : {avg_rms:.6f}")
             else:
-                print("\n  WARNING: No speech energy samples collected. "
+                print("\n  WARNING: No RMS samples collected. "
                       "Is the sound source active?")
-                avg_energy = 0.0
+                avg_rms = 0.0
             _save_calibration(
                 args.cal_json,
                 target_angle_deg=args.beam_deg,
                 target_distance_m=args.target_distance,
-                ref_energy=avg_energy,
+                ref_energy=avg_rms,
                 ref_rms=stats.peak_rms,
             )
             print("\nCalibration complete. Now run without --calibrate to use "
@@ -1806,8 +1806,8 @@ def main() -> int:
             attack_ms=args.attack_ms,
             hold_ms=args.hold_ms,
             angle_tolerance_deg=args.angle_tolerance,
-            ref_energy=ref_energy,
-            energy_tolerance=args.energy_tolerance,
+            ref_rms=ref_rms,
+            distance_ratio=1.0 - args.energy_tolerance,
             ratio_threshold=args.ratio_threshold,
             enable_spatial=not args.no_spatial,
             trigger_on_voice=args.trigger_on_voice,

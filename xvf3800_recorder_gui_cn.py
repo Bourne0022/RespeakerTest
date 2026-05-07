@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover
 
 
 APP_TITLE = "XVF3800 波束录音工具"
-DEFAULT_REF_ENERGY = 0.086293
+DEFAULT_REF_RMS = 0.086293
 
 
 class TextQueueWriter(io.TextIOBase):
@@ -109,7 +109,7 @@ class RecorderApp(tk.Tk):
         options = ttk.Frame(settings)
         options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(options, text="启用角度门控（无需定标）", variable=self.spatial_var).pack(side="left")
-        ttk.Checkbutton(options, text="启用距离门控（需要标定）", variable=self.distance_gate_var).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(options, text="启用距离门控（RMS 标定）", variable=self.distance_gate_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="检测到人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="录完后播放", variable=self.playback_var).pack(side="left", padx=(18, 0))
 
@@ -132,7 +132,7 @@ class RecorderApp(tk.Tk):
 
         hint = ttk.Label(
             root,
-            text="提示：当前默认按设备语音检测 + 30° 方向门控录音；标定文件仅用于以后启用距离门控。",
+            text="提示：当前默认按设备语音检测 + 30° 方向门控录音；距离门控使用标定里的 ref_rms。",
             foreground="#444",
         )
         hint.pack(fill="x", pady=(0, 8))
@@ -233,7 +233,7 @@ class RecorderApp(tk.Tk):
         angle_tolerance: float,
         ratio_threshold: float,
     ) -> None:
-        ref_energy = None
+        ref_rms = None
         enable_spatial = self.spatial_var.get()
         enable_distance = self.distance_gate_var.get()
 
@@ -242,19 +242,19 @@ class RecorderApp(tk.Tk):
                 cal_path = pathlib.Path(self.calibration_var.get()).expanduser().resolve()
                 if cal_path.exists():
                     cal = recorder._load_calibration(str(cal_path))
-                    ref_energy = cal.get("ref_energy")
-                    if ref_energy is None or float(ref_energy) <= 0:
-                        ref_energy = DEFAULT_REF_ENERGY
+                    ref_rms = cal.get("ref_rms", cal.get("ref_energy"))
+                    if ref_rms is None or float(ref_rms) <= 0:
+                        ref_rms = DEFAULT_REF_RMS
                         self.log_queue.put(
-                            f"标定文件无有效 ref_energy，改用默认参考值 {DEFAULT_REF_ENERGY:.6f}\n"
+                            f"标定文件无有效 ref_rms，改用默认参考值 {DEFAULT_REF_RMS:.6f}\n"
                         )
                     else:
-                        ref_energy = float(ref_energy)
+                        ref_rms = float(ref_rms)
                         self.log_queue.put(f"已加载标定文件：{cal_path}\n")
                 else:
-                    ref_energy = DEFAULT_REF_ENERGY
+                    ref_rms = DEFAULT_REF_RMS
                     self.log_queue.put(
-                        f"未找到标定文件：使用默认参考值 {DEFAULT_REF_ENERGY:.6f}。\n"
+                        f"未找到标定文件：使用默认参考值 {DEFAULT_REF_RMS:.6f}。\n"
                     )
             elif enable_spatial and not enable_distance:
                 self.log_queue.put("未启用距离门控：仅使用 30° 角度门控 + 人声触发。\n")
@@ -270,8 +270,8 @@ class RecorderApp(tk.Tk):
                     attack_ms=attack,
                     hold_ms=hold,
                     angle_tolerance_deg=angle_tolerance,
-                    ref_energy=ref_energy,
-                    energy_tolerance=0.30,
+                    ref_rms=ref_rms,
+                    distance_ratio=0.30,
                     ratio_threshold=ratio_threshold,
                     enable_spatial=enable_spatial,
                     stop_event=self.stop_event,

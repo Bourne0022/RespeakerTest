@@ -319,13 +319,13 @@ class CalibrationApp(tk.Tk):
                 raise RuntimeError("标定未产生任何有效结果。")
 
             self._write_csv(csv_path, results)
-            ref_energy = statistics.median(r.peak_rms for r in results)
-            self._write_json(json_path, results, beam, distance, ref_energy, duration, rms, attack, hold, device_hint)
+            ref_rms = statistics.median(r.peak_rms for r in results)
+            self._write_json(json_path, results, beam, distance, ref_rms, duration, rms, attack, hold, device_hint)
 
             self.log_queue.put("\n--- 标定完成 ---\n")
             self.log_queue.put(f"CSV 文件：{csv_path}\n")
             self.log_queue.put(f"JSON 文件：{json_path}\n")
-            self.log_queue.put(f"参考能量 ref_energy：{ref_energy:.6f}\n")
+            self.log_queue.put(f"参考 RMS ref_rms：{ref_rms:.6f}\n")
             self.log_queue.put("各次 Peak RMS：\n")
             for row in results:
                 self.log_queue.put(f"  {row.index:02d}: {row.peak_rms:.6f} ({row.filename})\n")
@@ -356,7 +356,7 @@ class CalibrationApp(tk.Tk):
         rows: list[RunResult],
         beam: float,
         distance: float,
-        ref_energy: float,
+        ref_rms: float,
         duration: float,
         rms: float,
         attack: float,
@@ -368,8 +368,8 @@ class CalibrationApp(tk.Tk):
         data = {
             "target_angle_deg": beam,
             "target_distance_m": distance,
-            "ref_energy": round(ref_energy, 6),
-            "ref_rms": round(ref_energy, 6),
+            "ref_energy": round(ref_rms, 6),
+            "ref_rms": round(ref_rms, 6),
             "runs": len(rows),
             "duration_sec": duration,
             "rms_threshold": rms,
