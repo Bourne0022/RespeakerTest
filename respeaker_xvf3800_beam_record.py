@@ -1224,7 +1224,9 @@ def configure_device(
 
     ctrl.write("AEC_FIXEDBEAMSAZIMUTH_VALUES", [beam_rad, opposite_rad])
     ctrl.write("AEC_FIXEDBEAMSELEVATION_VALUES", [0.0, 0.0])
-    ctrl.write("AEC_FIXEDBEAMSGATING", [0 if reference_beam else 1])
+    # Keep official fixed-beam gating enabled. Disabling it can collapse the
+    # target beam level on XVF3800 firmware even when DOA/VAD still reports OK.
+    ctrl.write("AEC_FIXEDBEAMSGATING", [1])
     ctrl.write("AEC_FIXEDBEAMSONOFF", [1])
     ctrl.write("AUDIO_MGR_OP_L", [6, 0])
     ctrl.write("AUDIO_MGR_OP_R", [6, 1] if reference_beam else [0, 0])
@@ -1261,7 +1263,7 @@ def configure_device(
     if elevations is not None and len(elevations) >= 2:
         el_ok = all(abs(e) < 0.1 for e in elevations[:2])
     en_ok = (enabled == (1,)) if enabled is not None else True
-    expected_gating = (0,) if reference_beam else (1,)
+    expected_gating = (1,)
     expected_op_r = (6, 1) if reference_beam else (0, 0)
     gating_ok = (gating == expected_gating) if gating is not None else True
     route_ok = (op_l == (6, 0)) if op_l is not None else True
