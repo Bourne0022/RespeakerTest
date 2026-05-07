@@ -41,8 +41,8 @@ class RecorderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("800x580")
-        self.minsize(760, 520)
+        self.geometry("940x600")
+        self.minsize(860, 540)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -59,6 +59,7 @@ class RecorderApp(tk.Tk):
         self.spatial_var = tk.BooleanVar(value=True)
         self.distance_gate_var = tk.BooleanVar(value=True)
         self.trigger_var = tk.BooleanVar(value=True)
+        self.denoise_var = tk.BooleanVar(value=True)
         self.calibration_var = tk.StringVar(value=str(self._app_dir() / "calibration.json"))
         self.playback_var = tk.BooleanVar(value=False)
         self.angle_tolerance_var = tk.StringVar(value="25")
@@ -111,6 +112,7 @@ class RecorderApp(tk.Tk):
         ttk.Checkbutton(options, text="启用角度门控（无需定标）", variable=self.spatial_var).pack(side="left")
         ttk.Checkbutton(options, text="启用距离门控（RMS 标定）", variable=self.distance_gate_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="检测到人声后才生成文件", variable=self.trigger_var).pack(side="left", padx=(18, 0))
+        ttk.Checkbutton(options, text="启用轻量降噪", variable=self.denoise_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="录完后播放", variable=self.playback_var).pack(side="left", padx=(18, 0))
 
         ttk.Label(settings, text="角度容差（度）").grid(row=5, column=0, sticky="w", pady=(8, 0))
@@ -276,6 +278,7 @@ class RecorderApp(tk.Tk):
                     enable_spatial=enable_spatial,
                     stop_event=self.stop_event,
                     trigger_on_voice=self.trigger_var.get(),
+                    denoise=self.denoise_var.get(),
                 )
 
             captured_sec = stats.received_frames / recorder.SAMPLE_RATE
@@ -297,6 +300,11 @@ class RecorderApp(tk.Tk):
                 self.log_queue.put(f"DOA 拒绝块数：{stats.doa_rejects}\n")
                 self.log_queue.put(f"能量拒绝块数：{stats.energy_rejects}\n")
                 self.log_queue.put(f"波束比拒绝块数：{stats.ratio_rejects}\n")
+            if stats.denoise_applied:
+                self.log_queue.put(
+                    f"轻量降噪：已应用，噪声参考 RMS={stats.denoise_noise_rms:.4f}，"
+                    f"处理后 Peak={stats.denoise_peak_rms:.4f}\n"
+                )
 
             if self.playback_var.get() and output_path.exists():
                 status = self._playback(output_path)

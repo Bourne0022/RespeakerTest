@@ -54,6 +54,11 @@ except ImportError as exc:
     ) from exc
 
 try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
+
+try:
     import libusb_package  # type: ignore[import-untyped]
 except Exception:
     libusb_package = None  # only needed on Windows
@@ -74,6 +79,9 @@ DEFAULT_BEAM_AZIMUTH_DEG = 30.0
 DEFAULT_RMS_THRESHOLD = 0.02
 DEFAULT_ATTACK_MS = 40.0
 DEFAULT_HOLD_MS = 400.0
+DEFAULT_DENOISE = True
+DEFAULT_DENOISE_STRENGTH = 0.65
+DEFAULT_DENOISE_MIN_GAIN = 0.35
 
 # ---------------------------------------------------------------------------
 # XVF3800 USB control parameter table
@@ -832,6 +840,112 @@ def extract_mono_bytes(raw_bytes: bytes, channels: int = CHANNELS) -> bytes:
     return mono.tobytes()
 
 
+@dataclass
+class DenoiseResult:
+    applied: bool = False
+    noise_rms: float = 0.0
+    peak_rms_after: float = 0.0
+
+
+def light_denoise_wav(
+    path: str,
+    strength: float = DEFAULT_DENOISE_STRENGTH,
+    min_gain: float = DEFAULT_DENOISE_MIN_GAIN,
+) -> DenoiseResult:
+    """Apply a conservative offline spectral gate to the mono WAV at *path*.
+
+    This is intentionally light: it estimates a noise profile from the quietest
+    saved frames, subtracts part of that profile, and keeps a higher gain floor
+    in the speech band so the target voice is not chopped into syllables.
+    """
+
+    if np is None:
+        print("Denoise skipped: numpy is not installed.", file=sys.stderr)
+        return DenoiseResult(applied=False)
+
+    wav_path = pathlib.Path(path)
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        return DenoiseResult(applied=False)
+
+    with wave.open(str(wav_path), "rb") as reader:
+        channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        sample_rate = reader.getframerate()
+        frame_count = reader.getnframes()
+        raw = reader.readframes(frame_count)
+
+    if channels != 1 or sample_width != SAMPLE_WIDTH_BYTES or sample_rate != SAMPLE_RATE:
+        print("Denoise skipped: WAV format is not 16 kHz mono int16.", file=sys.stderr)
+        return DenoiseResult(applied=False)
+
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if samples.size < 512:
+        return DenoiseResult(applied=False)
+
+    frame_size = 512
+    hop = 256
+    total_frames = max(1, int(math.ceil(max(0, samples.size - frame_size) / hop)) + 1)
+    padded_len = (total_frames - 1) * hop + frame_size
+    padded = np.zeros(padded_len, dtype=np.float32)
+    padded[: samples.size] = samples
+
+    window = np.hanning(frame_size).astype(np.float32)
+    spectra = []
+    frame_rms = []
+    for start in range(0, padded_len - frame_size + 1, hop):
+        frame = padded[start : start + frame_size]
+        frame_rms.append(float(np.sqrt(np.mean(frame * frame))))
+        spectra.append(np.fft.rfft(frame * window))
+
+    rms_values = np.asarray(frame_rms, dtype=np.float32)
+    quiet_count = max(3, min(len(rms_values), int(math.ceil(len(rms_values) * 0.20))))
+    quiet_idx = np.argsort(rms_values)[:quiet_count]
+    noise_mag = np.median(
+        np.abs(np.asarray([spectra[int(i)] for i in quiet_idx])),
+        axis=0,
+    )
+    noise_rms = float(np.median(rms_values[quiet_idx]))
+
+    freqs = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
+    gain_floor = np.full_like(freqs, min_gain, dtype=np.float32)
+    speech_band = (freqs >= 120.0) & (freqs <= 3800.0)
+    gain_floor[speech_band] = np.maximum(gain_floor[speech_band], 0.55)
+    gain_floor[freqs < 80.0] = np.minimum(gain_floor[freqs < 80.0], 0.20)
+
+    out = np.zeros(padded_len, dtype=np.float32)
+    norm = np.zeros(padded_len, dtype=np.float32)
+    eps = 1e-8
+    strength = min(max(strength, 0.0), 1.0)
+
+    for idx, start in enumerate(range(0, padded_len - frame_size + 1, hop)):
+        spec = spectra[idx]
+        mag = np.abs(spec)
+        gain = 1.0 - strength * (noise_mag / (mag + eps))
+        gain = np.clip(gain, gain_floor, 1.0)
+        clean = np.fft.irfft(spec * gain, n=frame_size).astype(np.float32)
+        out[start : start + frame_size] += clean * window
+        norm[start : start + frame_size] += window * window
+
+    out = out / np.maximum(norm, eps)
+    out = out[: samples.size]
+
+    original_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    clean_peak = float(np.max(np.abs(out))) if out.size else 0.0
+    if original_peak > 0.0 and clean_peak > original_peak:
+        out *= original_peak / clean_peak
+
+    peak_after = float(np.sqrt(np.max(out * out))) if out.size else 0.0
+    pcm = np.clip(out * 32767.0, -32768, 32767).astype("<i2")
+
+    with wave.open(str(wav_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(SAMPLE_WIDTH_BYTES)
+        writer.setframerate(SAMPLE_RATE)
+        writer.writeframes(pcm.tobytes())
+
+    return DenoiseResult(applied=True, noise_rms=noise_rms, peak_rms_after=peak_after)
+
+
 # ======================================================================
 # Keyboard listener (cross-platform)
 # ======================================================================
@@ -896,6 +1010,9 @@ class RecordStats:
     energy_rejects: int = 0
     ratio_rejects: int = 0
     speech_samples: int = 0
+    denoise_applied: bool = False
+    denoise_noise_rms: float = 0.0
+    denoise_peak_rms: float = 0.0
     doa_samples: list[float] = None  # type: ignore[assignment]
     energy_samples: list[float] = None  # type: ignore[assignment]
 
@@ -1394,6 +1511,8 @@ def record(
     enable_spatial: bool = True,
     stop_event: Optional[threading.Event] = None,
     trigger_on_voice: bool = True,
+    denoise: bool = DEFAULT_DENOISE,
+    denoise_strength: float = DEFAULT_DENOISE_STRENGTH,
 ) -> RecordStats:
     """Record chunks that pass device VAD, DOA and optional distance checks."""
 
@@ -1629,6 +1748,17 @@ def record(
             wf.close()
         ctrl.close()
 
+    if denoise and stats.saved_frames > 0:
+        result = light_denoise_wav(output_path, strength=denoise_strength)
+        stats.denoise_applied = result.applied
+        stats.denoise_noise_rms = result.noise_rms
+        stats.denoise_peak_rms = result.peak_rms_after
+        if result.applied:
+            print(
+                f"Light denoise applied: noise_rms={result.noise_rms:.4f}, "
+                f"peak_after={result.peak_rms_after:.4f}"
+            )
+
     if trigger_on_voice and stats.saved_frames == 0:
         print("No qualifying 30 deg voice detected; WAV was not created.", file=sys.stderr)
 
@@ -1710,6 +1840,14 @@ def parse_args():
         help="Create the WAV only after the first RMS/DOA/energy-approved voice chunk",
     )
     p.add_argument(
+        "--no-denoise", action="store_true",
+        help="Disable the lightweight post-recording denoise pass",
+    )
+    p.add_argument(
+        "--denoise-strength", type=float, default=DEFAULT_DENOISE_STRENGTH,
+        help=f"Light denoise strength 0-1 (default: {DEFAULT_DENOISE_STRENGTH})",
+    )
+    p.add_argument(
         "--target-distance", type=float, default=0.5,
         help="Target distance in meters for calibration record (default: 0.5)",
     )
@@ -1733,6 +1871,9 @@ def main() -> int:
         return 1
     if not 0.0 <= args.energy_tolerance <= 1.0:
         print("ERROR: --energy-tolerance must be between 0.0 and 1.0", file=sys.stderr)
+        return 1
+    if not 0.0 <= args.denoise_strength <= 1.0:
+        print("ERROR: --denoise-strength must be between 0.0 and 1.0", file=sys.stderr)
         return 1
 
     print("=" * 58)
@@ -1811,6 +1952,8 @@ def main() -> int:
             ratio_threshold=args.ratio_threshold,
             enable_spatial=not args.no_spatial,
             trigger_on_voice=args.trigger_on_voice,
+            denoise=not args.no_denoise,
+            denoise_strength=args.denoise_strength,
         )
     except RuntimeError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
@@ -1831,6 +1974,14 @@ def main() -> int:
     print(f"  Captured  : {recv_sec:.2f} s  ({stats.received_chunks} chunks)")
     print(f"  Saved     : {saved_sec:.2f} s  ({stats.saved_chunks} chunks, {ratio:.1f}%)")
     print(f"  Peak RMS  : {stats.peak_rms:.4f}")
+    if stats.denoise_applied:
+        print(
+            f"  Denoise   : applied "
+            f"(noise_rms={stats.denoise_noise_rms:.4f}, "
+            f"peak_after={stats.denoise_peak_rms:.4f})"
+        )
+    elif not args.no_denoise and saved_sec > 0.0:
+        print("  Denoise   : skipped")
     if stats.speech_rejects or stats.doa_rejects or stats.energy_rejects or stats.ratio_rejects:
         print(f"  Speech rejects: {stats.speech_rejects} chunks")
         print(f"  DOA rejects   : {stats.doa_rejects} chunks")
