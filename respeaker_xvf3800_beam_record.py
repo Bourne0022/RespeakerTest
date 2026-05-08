@@ -849,14 +849,14 @@ def suppress_offaxis_bytes(
     aligned_ref, cancel_coeff, cancel_corr = best_reference_alignment(target, reference)
     if cancel_corr >= 0.08:
         if relative_ref < 0.45:
-            cancel_strength = 0.20
+            cancel_strength = 0.12
         elif relative_ref < 0.80:
-            cancel_strength = 0.45
+            cancel_strength = 0.32
         elif relative_ref < 1.25:
-            cancel_strength = 0.70
+            cancel_strength = 0.65
         else:
             cancel_strength = 0.90
-        cancel_coeff = max(-1.25, min(1.25, cancel_coeff))
+        cancel_coeff = max(-1.00, min(1.00, cancel_coeff))
         working = target - (cancel_coeff * cancel_strength * aligned_ref)
 
     n = target.size
@@ -884,11 +884,11 @@ def suppress_offaxis_bytes(
     # Rear voice:    relative_ref ≈ 1.0-3.0  →  heavy suppression
     base_strength = min(max(strength, 0.0), 1.0)
     if relative_ref < 0.45:
-        strength_scale = 0.25
+        strength_scale = 0.18
     elif relative_ref < 0.70:
-        strength_scale = 0.65
+        strength_scale = 0.50
     elif relative_ref < 1.10:
-        strength_scale = 0.95
+        strength_scale = 0.90
     elif relative_ref < 1.60:
         strength_scale = 1.10
     else:
